@@ -1160,15 +1160,64 @@ def upsert_jobs(
     ]
 
 
-def _clamp_positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
-    """Coerce to int and enforce a hard minimum (parameter caps)."""
+def _clamp_positive_int(
+    value: Any,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: Optional[int] = None,
+) -> int:
+    """Coerce to int and enforce hard min/max parameter caps."""
     try:
         n = int(value)
     except (TypeError, ValueError):
         n = int(default)
     if n < minimum:
-        return minimum
+        n = minimum
+    if maximum is not None and n > maximum:
+        n = maximum
     return n
+
+
+def _job_within_hours_old(job: dict, hours_old: int) -> bool:
+    """
+    Strict recency check after LinkedIn returns rows.
+    jobspy's hours_old is best-effort; LinkedIn often only exposes day-level dates.
+    """
+    hours_old = max(1, int(hours_old or 1))
+    ta = (job.get("time_ago") or "").strip().lower()
+
+    if ta:
+        if any(x in ta for x in ("just now", "moment", "seconds", "second ago")):
+            return True
+        m = re.search(r"(\d+)\s*min", ta)
+        if m:
+            return (int(m.group(1)) / 60.0) <= float(hours_old)
+        m = re.search(r"(\d+)\s*hour", ta)
+        if m:
+            return int(m.group(1)) <= hours_old
+        m = re.search(r"(\d+)\s*day", ta)
+        if m:
+            return int(m.group(1)) * 24 <= hours_old
+        m = re.search(r"(\d+)\s*week", ta)
+        if m:
+            return int(m.group(1)) * 24 * 7 <= hours_old
+        if "month" in ta or "year" in ta:
+            return False
+
+    raw = (job.get("date_posted") or "").strip()[:10]
+    if raw:
+        try:
+            posted = date.fromisoformat(raw)
+            # Day-level precision: allow jobs within ceil(hours_old/24) calendar days
+            max_days = max(0, math.ceil(hours_old / 24.0))
+            delta = (date.today() - posted).days
+            return 0 <= delta <= max_days
+        except Exception:
+            pass
+
+    # Unknown age — keep (jobspy already applied hours_old); strict drop only if parseable
+    return True
 
 
 def begin_live_stream_snapshot(
@@ -1288,21 +1337,36 @@ def scrape_external_jobs(
         fallback = (cfg.get("country") or "India").strip()
         country_list = [fallback] if fallback else ["India"]
 
-    # Hard-clamp parameter caps — never go below 1; never inflate beyond request
+    # Hard-clamp parameter caps (min + max ceilings for live stream)
     results_per = _clamp_positive_int(
         results_per if results_per is not None else cfg.get("results_per"),
         int(cfg.get("results_per") or 10),
+        maximum=50,
     )
     hours_old = _clamp_positive_int(
         hours_old if hours_old is not None else cfg.get("hours_old"),
         int(cfg.get("hours_old") or 6),
+        maximum=168,
     )
     target = _clamp_positive_int(
         target if target is not None else cfg.get("target"),
         int(cfg.get("target") or 20),
+        maximum=200,
     )
     country_indeed = resolve_indeed_country(country_list, "India")
     session_col = (collection_name or "").strip() or None
+
+    # Cap how many LinkedIn calls we make while searching (strict live stream).
+    # Without this, all queries × cities run even when hours_old yields empty batches
+    # → feels like caps are ignored and searching never ends.
+    total_combos = max(1, len(queries) * len(cities))
+    if strict_caps:
+        # Enough attempts to fill target, with headroom for empty/dups — not full cartesian.
+        needed = max(1, math.ceil(target / max(1, results_per)))
+        max_scrape_calls = min(total_combos, max(target * 2, needed * 4 + 2))
+        max_scrape_calls = max(1, int(max_scrape_calls))
+    else:
+        max_scrape_calls = total_combos
 
     meta: dict[str, Any] = {
         "queries": queries,
@@ -1312,14 +1376,17 @@ def scrape_external_jobs(
         "hours_old": hours_old,
         "target": target,
         "strict_caps": bool(strict_caps),
+        "max_scrape_calls": max_scrape_calls,
         "collection_name": session_col or JOBS_COLLECTION_NAME,
         "site": "linkedin",
         "attempts": [],
         "expanded_hours": None,
+        "stopped_reason": None,
     }
 
     collected: list[dict] = []
     seen_urls: set[str] = set()
+    scrape_calls = 0
 
     def _notify_status(msg: str) -> None:
         if on_status:
@@ -1338,19 +1405,32 @@ def scrape_external_jobs(
         )
 
     def run_pass(hours: int) -> None:
-        nonlocal collected
+        nonlocal collected, scrape_calls
         # Strict cap: never scrape with a wider hours window than requested
         hours = min(int(hours), hours_old) if strict_caps else int(hours)
         for qi, q in enumerate(queries, 1):
             if len(collected) >= target:
+                meta["stopped_reason"] = "target_reached"
                 return
             for city_name in cities:
                 if len(collected) >= target:
+                    meta["stopped_reason"] = "target_reached"
+                    return
+                if scrape_calls >= max_scrape_calls:
+                    meta["stopped_reason"] = "max_scrape_calls"
+                    _notify_status(
+                        f"Search attempt cap reached ({scrape_calls}/{max_scrape_calls} "
+                        f"LinkedIn calls). Stopping early — target={target}, "
+                        f"results_per={results_per}, hours_old={hours}. "
+                        f"Narrow queries/cities or raise Target / Hits per query."
+                    )
                     return
 
+                scrape_calls += 1
                 _notify_status(
-                    f"[{qi:02d}/{len(queries)}] LinkedIn scrape: {q!r} @ {city_name} "
-                    f"(hours_old={hours}, results={results_per}, target_cap={target}"
+                    f"[{qi:02d}/{len(queries)} · call {scrape_calls}/{max_scrape_calls}] "
+                    f"LinkedIn scrape: {q!r} @ {city_name} "
+                    f"(hours_old={hours}, results≤{results_per}, target≤{target}"
                     f"{f', col={session_col}' if session_col else ''})"
                 )
                 try:
@@ -1365,6 +1445,15 @@ def scrape_external_jobs(
                     # Never keep more raw rows than results_per asked for
                     if len(batch) > results_per:
                         batch = batch[:results_per]
+                    # Strict recency: drop rows outside hours_old (jobspy can leak older posts)
+                    if strict_caps:
+                        before = len(batch)
+                        batch = [j for j in batch if _job_within_hours_old(j, hours)]
+                        dropped = before - len(batch)
+                        if dropped:
+                            _notify_status(
+                                f"  Dropped {dropped} job(s) outside hours_old≤{hours}h window"
+                            )
                     meta["attempts"].append(
                         {
                             "query": q,
@@ -1401,6 +1490,9 @@ def scrape_external_jobs(
                     max_exp=max_exp,
                     strict_search=False,
                 )
+                # Hard per-call cap after filters
+                if len(filtered) > results_per:
+                    filtered = filtered[:results_per]
 
                 added = 0
                 for job in filtered:
@@ -1434,20 +1526,31 @@ def scrape_external_jobs(
                         except Exception:
                             pass
                     if len(collected) >= target:
+                        meta["stopped_reason"] = "target_reached"
                         _notify_status(
                             f"Reached target cap of {target} unique jobs "
-                            f"(collection total={db_meta['total_count']})."
+                            f"(collection total={db_meta['total_count']}). "
+                            f"Stopping search (no more LinkedIn calls)."
                         )
                         return
 
                 _notify_status(
                     f"  +{added} new from {city_name} for {q!r} "
                     f"(session={len(collected)}/{target}, "
+                    f"calls={scrape_calls}/{max_scrape_calls}, "
                     f"db_total={_session_db_meta(len(collected))['total_count']})"
                 )
-                # Same anti-rate-limit delay as linkedin_realtime_hyderabad.py
-                time.sleep(random.uniform(1.5, 2.5))
+                # Anti-rate-limit delay — skip if we're done
+                if len(collected) >= target or scrape_calls >= max_scrape_calls:
+                    return
+                time.sleep(random.uniform(1.2, 2.0) if strict_caps else random.uniform(1.5, 2.5))
 
+    _notify_status(
+        f"Live scrape plan: {len(queries)} quer(y/ies) × {len(cities)} cit(y/ies) "
+        f"= {total_combos} max combos · attempt cap {max_scrape_calls} · "
+        f"target≤{target} · results/q≤{results_per} · hours_old={hours_old} "
+        f"· strict_caps={bool(strict_caps)}"
+    )
     run_pass(hours_old)
 
     # Auto-expand hours only when NOT in strict_caps mode (Live Stream is strict).
@@ -1924,10 +2027,10 @@ async def websocket_jobs(websocket: WebSocket):
                 search = data.get("search", "") or ""
                 city = data.get("city", "") or ""
                 category = data.get("category", "") or ""
-                # Strict parameter caps — never below 1; values are hard ceilings
-                target = _clamp_positive_int(data.get("target"), 20)
-                results_per = _clamp_positive_int(data.get("results_per"), 10)
-                hours_old = _clamp_positive_int(data.get("hours_old"), 6)
+                # Strict parameter caps — hard min/max ceilings for live stream
+                target = _clamp_positive_int(data.get("target"), 20, maximum=200)
+                results_per = _clamp_positive_int(data.get("results_per"), 10, maximum=50)
+                hours_old = _clamp_positive_int(data.get("hours_old"), 6, maximum=168)
                 min_exp = data.get("min_exp")
                 max_exp = data.get("max_exp")
                 if min_exp is not None:
