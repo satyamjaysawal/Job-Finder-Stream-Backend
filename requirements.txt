@@ -1,0 +1,24 @@
+# Web framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+
+# Config
+python-dotenv>=1.0.0
+
+# Database
+pymongo>=4.6.0
+dnspython>=2.0.0
+
+# LinkedIn scrape (same stack as linkedin_realtime_hyderabad.py)
+# On Python 3.13+ if pins fail:
+#   pip install python-jobspy --no-deps
+#   pip install pandas requests beautifulsoup4 tls-client markdownify regex numpy
+python-jobspy>=1.1.80
+pandas>=2.1.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+tls-client>=1.0.0
+markdownify>=0.13.1
+regex>=2024.4.28
+numpy>=1.26.0
