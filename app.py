@@ -64,18 +64,33 @@ RESERVED_COLLECTIONS: frozenset[str] = frozenset(
     }
 )
 
-# CORS Configuration (Standard localhost Vite ports + env configuration)
+# CORS Configuration (localhost Vite ports + FRONTEND_URL / CORS_ORIGINS)
 _default_origins = [
     "http://127.0.0.1:5173",
     "http://localhost:5173",
     "http://127.0.0.1:4173",
-    "http://localhost:4173"
+    "http://localhost:4173",
 ]
-_raw_origins = os.getenv("CORS_ORIGINS")
-if _raw_origins:
-    CORS_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
-else:
-    CORS_ORIGINS: list[str] = _default_origins
+
+
+def _parse_origin_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+
+
+# FRONTEND_URL may be a single origin or comma-separated list (production Vercel URL)
+FRONTEND_URL: str = (os.getenv("FRONTEND_URL") or "http://127.0.0.1:5173").strip().rstrip("/")
+_env_cors = _parse_origin_list(os.getenv("CORS_ORIGINS"))
+_frontend_origins = _parse_origin_list(os.getenv("FRONTEND_URL"))
+
+# Merge env origins with local defaults (dedupe, preserve order)
+_seen: set[str] = set()
+CORS_ORIGINS: list[str] = []
+for o in _env_cors + _frontend_origins + _default_origins:
+    if o and o not in _seen:
+        _seen.add(o)
+        CORS_ORIGINS.append(o)
 
 CORS_ALLOW_CREDENTIALS: bool = True
 CORS_ALLOW_METHODS: list[str] = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
@@ -104,7 +119,7 @@ def public_settings_dict() -> dict:
         "api_prefix": API_PREFIX,
         "host": HOST,
         "port": PORT,
-        "frontend_url": "http://127.0.0.1:5173",
+        "frontend_url": FRONTEND_URL,
         "cors_origins": CORS_ORIGINS,
         "database": DATABASE_NAME,
     }
@@ -232,12 +247,20 @@ def _ensure_indexes() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Startup: indexes + config seed + background poller. Shutdown: cancel poller."""
-    _ensure_indexes()
-    ensure_config_document()
-    polling_task = asyncio.create_task(poll_new_jobs())
+    """Startup: indexes + config seed + optional background poller. Shutdown: cancel poller."""
+    # On Vercel serverless, skip long-lived background tasks (cold starts / no WS).
+    is_serverless = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+    try:
+        _ensure_indexes()
+        ensure_config_document()
+    except Exception as e:
+        print(f"Startup init warning: {e}")
+    polling_task = None
+    if not is_serverless:
+        polling_task = asyncio.create_task(poll_new_jobs())
     yield
-    polling_task.cancel()
+    if polling_task is not None:
+        polling_task.cancel()
 
 
 app = FastAPI(
