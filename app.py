@@ -788,8 +788,18 @@ def country_aliases(name: str) -> set[str]:
     return aliases
 
 
-def resolve_indeed_country(countries: list[str], fallback: Optional[str] = None) -> str:
-    for raw in [*countries, fallback or ""]:
+def resolve_indeed_country(
+    countries: list[str],
+    fallback: Optional[str] = None,
+    *,
+    default_if_empty: Optional[str] = None,
+) -> str:
+    """
+    Map country names to JobSpy/Indeed country codes.
+    When nothing is selected, returns default_if_empty (None → "") so global
+    search is not forced into India.
+    """
+    for raw in [*(countries or []), fallback or ""]:
         key = (raw or "").strip().lower()
         if not key:
             continue
@@ -800,7 +810,75 @@ def resolve_indeed_country(countries: list[str], fallback: Optional[str] = None)
                 return mapped
         # JobSpy accepts free-form names for many countries
         return raw.strip()
-    return "India"
+    return (default_if_empty or "").strip()
+
+
+def build_location_plans(
+    cities: list[str],
+    countries: list[str],
+) -> list[dict[str, Any]]:
+    """
+    Optional city/country → LinkedIn scrape location plans.
+
+    Rules:
+      - neither selected  → one global plan (empty location, no country filter)
+      - city only         → plan per city, no country filter
+      - country only      → plan per country (location = country name)
+      - both              → plan per city, country_indeed from selected countries
+    """
+    city_list = [c.strip() for c in (cities or []) if (c or "").strip()]
+    country_list = [c.strip() for c in (countries or []) if (c or "").strip()]
+
+    if city_list and country_list:
+        country_code = resolve_indeed_country(country_list, default_if_empty="")
+        return [
+            {
+                "location": city,
+                "country_indeed": country_code,
+                "label": f"{city}, {country_code or country_list[0]}",
+                "filter_city": city,
+                "filter_countries": country_list,
+            }
+            for city in city_list
+        ]
+
+    if city_list:
+        return [
+            {
+                "location": city,
+                "country_indeed": "",
+                "label": city,
+                "filter_city": city,
+                "filter_countries": [],
+            }
+            for city in city_list
+        ]
+
+    if country_list:
+        plans: list[dict[str, Any]] = []
+        for co in country_list:
+            code = resolve_indeed_country([co], default_if_empty=co)
+            plans.append(
+                {
+                    "location": co,
+                    "country_indeed": code,
+                    "label": co,
+                    "filter_city": "",
+                    "filter_countries": [co],
+                }
+            )
+        return plans
+
+    # Global — no geo filter
+    return [
+        {
+            "location": "",
+            "country_indeed": "",
+            "label": "Global",
+            "filter_city": "",
+            "filter_countries": [],
+        }
+    ]
 
 
 def job_matches_exp_range(description: str, min_exp: Optional[int], max_exp: Optional[int]) -> bool:
@@ -869,13 +947,16 @@ def _job_matches_country(job: dict, selected_countries: list[str]) -> bool:
     blob = f"{job_country} {job_loc}"
     for raw in selected_countries:
         aliases = country_aliases(raw)
-        if any(alias and alias in blob for alias in aliases):
-            return True
-        # Location fragments like "TS, IN" / "Hyderabad, India"
         for alias in aliases:
+            if not alias:
+                continue
+            # Short codes (in, us, uk, de) must be whole tokens — never substring
+            # ("in" must not match inside "united kingdom").
             if len(alias) <= 3:
-                # short codes: match as , IN / IN / (IN)
-                if re.search(rf"(?:^|,\s*|\s){re.escape(alias)}(?:$|\s|,)", blob):
+                if re.search(
+                    rf"(?:^|[\s,;/|(]){re.escape(alias)}(?:$|[\s,;/)|])",
+                    blob,
+                ):
                     return True
             elif alias in blob:
                 return True
@@ -990,12 +1071,12 @@ def scrape_linkedin(
     results: int,
     hours_old: int,
     *,
-    country_indeed: str = "India",
+    country_indeed: str = "",
     default_city: str = "",
 ) -> list[dict]:
     """
     Call python-jobspy for LinkedIn only (mirrors linkedin_realtime_hyderabad.py).
-    Returns normalized job dicts ready for MongoDB / WebSocket.
+    Empty location + empty country_indeed = global search (no geo bias).
     """
     if jobspy_scrape_jobs is None:
         raise RuntimeError(
@@ -1004,23 +1085,28 @@ def scrape_linkedin(
             "pip install pandas requests beautifulsoup4 tls-client markdownify regex numpy"
         )
 
-    loc = (location or "").strip() or "Hyderabad"
+    loc = (location or "").strip()
+    country_code = (country_indeed or "").strip()
     results = max(1, int(results or 10))
     hours_old = max(1, int(hours_old or 6))
-    fallback_city = (default_city or loc.split(",")[0].strip() or "Hyderabad")
+    fallback_city = (default_city or (loc.split(",")[0].strip() if loc else "") or "Global")
+
+    scrape_kwargs: dict[str, Any] = {
+        "site_name": ["linkedin"],
+        "search_term": query,
+        "results_wanted": results,
+        "hours_old": hours_old,
+        "verbose": 0,
+    }
+    if loc:
+        scrape_kwargs["location"] = loc
+    if country_code:
+        scrape_kwargs["country_indeed"] = country_code
 
     try:
-        df = jobspy_scrape_jobs(
-            site_name=["linkedin"],
-            search_term=query,
-            location=loc,
-            results_wanted=results,
-            hours_old=hours_old,
-            country_indeed=country_indeed or "India",
-            verbose=0,
-        )
+        df = jobspy_scrape_jobs(**scrape_kwargs)
     except Exception as e:
-        print(f"    scrape_linkedin ERROR ({query!r} @ {loc!r}): {e}")
+        print(f"    scrape_linkedin ERROR ({query!r} @ {loc or 'Global'!r}): {e}")
         return []
 
     if df is None or getattr(df, "empty", True):
@@ -1049,7 +1135,7 @@ def scrape_linkedin(
 
         location_val = str(row.get("location", "") or "").strip()
         if not location_val or location_val.lower() == "nan":
-            location_val = loc
+            location_val = loc or "Global"
 
         city = _city_from_location(location_val, fallback_city)
         title = str(row.get("title", "") or "").strip()
@@ -1065,7 +1151,7 @@ def scrape_linkedin(
                 "company": company or "Unknown",
                 "location": location_val,
                 "city": city,
-                "country": country_indeed or "India",
+                "country": country_code or "Global",
                 "job_url": url,
                 "date_posted": date_posted,
                 "time_ago": time_ago,
@@ -1331,11 +1417,20 @@ def scrape_external_jobs(
     queries = _split_csv(search) or list(cfg.get("search_queries") or [])[:1] or [
         "Software Engineer"
     ]
-    cities = _split_csv(city) or list(cfg.get("cities") or [])[:1] or ["Hyderabad"]
+    # City & country are OPTIONAL — only use what the client sent.
+    # Empty = global search (do NOT fall back to config India/Hyderabad).
+    cities = _split_csv(city)
     country_list = _split_csv(countries)
-    if not country_list:
-        fallback = (cfg.get("country") or "India").strip()
-        country_list = [fallback] if fallback else ["India"]
+    location_plans = build_location_plans(cities, country_list)
+    geo_mode = (
+        "city+country"
+        if cities and country_list
+        else "city"
+        if cities
+        else "country"
+        if country_list
+        else "global"
+    )
 
     # Hard-clamp parameter caps (min + max ceilings for live stream)
     results_per = _clamp_positive_int(
@@ -1353,14 +1448,12 @@ def scrape_external_jobs(
         int(cfg.get("target") or 20),
         maximum=200,
     )
-    country_indeed = resolve_indeed_country(country_list, "India")
     session_col = (collection_name or "").strip() or None
 
     # How many LinkedIn calls while searching.
     # Target is the PRIMARY stop condition (unique jobs).
-    # results_per is preferred batch size — auto-scaled up when few query×city
-    # combos remain so Target=20 is reachable even if Hits/Query=5 with 1×1 selection.
-    total_combos = max(1, len(queries) * len(cities))
+    # results_per is preferred batch size — auto-scaled up when few plans remain.
+    total_combos = max(1, len(queries) * len(location_plans))
     needed_by_hits = max(1, math.ceil(target / max(1, results_per)))
     if strict_caps:
         if total_combos <= max(12, needed_by_hits * 2):
@@ -1380,6 +1473,8 @@ def scrape_external_jobs(
         "queries": queries,
         "cities": cities,
         "countries": country_list,
+        "geo_mode": geo_mode,
+        "location_plans": [p.get("label") for p in location_plans],
         "results_per": results_per,
         "hours_old": hours_old,
         "target": target,
@@ -1421,7 +1516,7 @@ def scrape_external_jobs(
             if len(collected) >= target:
                 meta["stopped_reason"] = "target_reached"
                 return
-            for city_name in cities:
+            for plan in location_plans:
                 if len(collected) >= target:
                     meta["stopped_reason"] = "target_reached"
                     return
@@ -1430,34 +1525,42 @@ def scrape_external_jobs(
                     _notify_status(
                         f"Search attempt cap reached ({scrape_calls}/{max_scrape_calls} "
                         f"LinkedIn calls). Session={len(collected)}/{target}. "
-                        f"Add more queries/cities or raise Hits/Query if under target."
+                        f"Add more queries/locations or raise Hits/Query if under target."
                     )
                     return
+
+                loc_label = plan.get("label") or "Global"
+                loc_value = plan.get("location") or ""
+                country_code = plan.get("country_indeed") or ""
+                filter_city = plan.get("filter_city") or ""
+                filter_countries = list(plan.get("filter_countries") or [])
+                # Session-level filters: apply any selected cities/countries overall
+                city_param = ",".join(cities) if cities else ""
+                country_param = ",".join(country_list) if country_list else ""
 
                 remaining = target - len(collected)
                 combos_left = max(1, total_combos - combo_index)
                 combo_index += 1
                 # Fair share so remaining combos can still fill target.
-                # Example: target=20, results_per=5, 1 combo left → request 20 (not 5).
                 fair_share = max(1, math.ceil(remaining / combos_left))
                 results_this_call = min(50, remaining, max(int(results_per), fair_share))
 
                 scrape_calls += 1
                 _notify_status(
                     f"[{qi:02d}/{len(queries)} · call {scrape_calls}/{max_scrape_calls}] "
-                    f"LinkedIn scrape: {q!r} @ {city_name} "
-                    f"(hours_old={hours}, request≤{results_this_call}, "
+                    f"LinkedIn scrape: {q!r} @ {loc_label} "
+                    f"(geo={geo_mode}, hours_old={hours}, request≤{results_this_call}, "
                     f"hits_pref={results_per}, remaining={remaining}, target={target}"
                     f"{f', col={session_col}' if session_col else ''})"
                 )
                 try:
                     batch = scrape_linkedin(
                         query=q,
-                        location=city_name,
+                        location=loc_value,
                         results=results_this_call,
                         hours_old=hours,
-                        country_indeed=country_indeed,
-                        default_city=city_name,
+                        country_indeed=country_code,
+                        default_city=filter_city or loc_value,
                     )
                     # Cap raw batch to what we requested for this call
                     if len(batch) > results_this_call:
@@ -1474,41 +1577,53 @@ def scrape_external_jobs(
                     meta["attempts"].append(
                         {
                             "query": q,
-                            "city": city_name,
-                            "country": country_indeed,
+                            "location": loc_label,
+                            "city": filter_city or None,
+                            "country": country_code or None,
                             "hours_old": hours,
                             "results_requested": results_this_call,
                             "results_per_pref": results_per,
                             "raw_count": len(batch),
                             "site": "linkedin",
+                            "geo_mode": geo_mode,
                         }
                     )
                 except Exception as e:
                     meta["attempts"].append(
                         {
                             "query": q,
-                            "city": city_name,
-                            "country": country_indeed,
+                            "location": loc_label,
+                            "city": filter_city or None,
+                            "country": country_code or None,
                             "hours_old": hours,
                             "results_requested": results_this_call,
                             "results_per_pref": results_per,
                             "error": str(e),
                             "site": "linkedin",
+                            "geo_mode": geo_mode,
                         }
                     )
-                    _notify_status(f"Scrape error for '{q}' / '{city_name}': {e}")
+                    _notify_status(f"Scrape error for '{q}' / '{loc_label}': {e}")
                     continue
 
-                # Optional experience filter only — LinkedIn already applied query/location.
+                # Apply geo filters only when user selected city and/or country.
+                # Empty city_param / country_param → no geo filter (global keep).
                 filtered = filter_jobs_list(
                     batch,
                     search="",
-                    city_param="",
-                    country_param="",
+                    city_param=city_param,
+                    country_param=country_param,
                     min_exp=min_exp,
                     max_exp=max_exp,
                     strict_search=False,
                 )
+                if city_param or country_param:
+                    dropped_geo = len(batch) - len(filtered)
+                    if dropped_geo > 0:
+                        _notify_status(
+                            f"  Geo-filter dropped {dropped_geo} job(s) "
+                            f"(city={city_param or 'any'}, country={country_param or 'any'})"
+                        )
                 # Per-call cap = results_this_call (may be > results_per to fill target)
                 if len(filtered) > results_this_call:
                     filtered = filtered[:results_this_call]
@@ -1554,7 +1669,7 @@ def scrape_external_jobs(
                         return
 
                 _notify_status(
-                    f"  +{added} new from {city_name} for {q!r} "
+                    f"  +{added} new from {loc_label} for {q!r} "
                     f"(session={len(collected)}/{target}, "
                     f"calls={scrape_calls}/{max_scrape_calls}, "
                     f"db_total={_session_db_meta(len(collected))['total_count']})"
@@ -1565,11 +1680,11 @@ def scrape_external_jobs(
                 time.sleep(random.uniform(1.2, 2.0) if strict_caps else random.uniform(1.5, 2.5))
 
     _notify_status(
-        f"Live scrape plan: {len(queries)} quer(y/ies) × {len(cities)} cit(y/ies) "
-        f"= {total_combos} combos · max_calls={max_scrape_calls} · "
-        f"TARGET={target} (hard stop) · hits_pref={results_per} "
-        f"(auto-scales up per call to fill target) · hours_old={hours_old} "
-        f"· strict_caps={bool(strict_caps)}"
+        f"Live scrape plan: {len(queries)} quer(y/ies) × {len(location_plans)} location(s) "
+        f"[{geo_mode}] = {total_combos} combos · max_calls={max_scrape_calls} · "
+        f"TARGET={target} · hits_pref={results_per} · hours_old={hours_old} · "
+        f"cities={cities or ['(global)']} · countries={country_list or ['(global)']} · "
+        f"strict_caps={bool(strict_caps)}"
     )
     run_pass(hours_old)
 
@@ -1857,7 +1972,8 @@ def search_and_create_json(data: SearchCreateJson = SearchCreateJson()):
             jobs, _meta = scrape_external_jobs(
                 search=data.search or "",
                 city=data.city or "",
-                countries=(cfg.get("country") or "India"),
+                # Optional: empty city/country → global (no forced India)
+                countries="",
                 results_per=int(cfg.get("results_per") or 10),
                 hours_old=int(cfg.get("hours_old") or 6),
                 target=int(data.limit or cfg.get("target") or 20),
