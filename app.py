@@ -1356,14 +1356,22 @@ def scrape_external_jobs(
     country_indeed = resolve_indeed_country(country_list, "India")
     session_col = (collection_name or "").strip() or None
 
-    # Cap how many LinkedIn calls we make while searching (strict live stream).
-    # Without this, all queries × cities run even when hours_old yields empty batches
-    # → feels like caps are ignored and searching never ends.
+    # How many LinkedIn calls while searching.
+    # Target is the PRIMARY stop condition (unique jobs).
+    # results_per is preferred batch size — auto-scaled up when few query×city
+    # combos remain so Target=20 is reachable even if Hits/Query=5 with 1×1 selection.
     total_combos = max(1, len(queries) * len(cities))
+    needed_by_hits = max(1, math.ceil(target / max(1, results_per)))
     if strict_caps:
-        # Enough attempts to fill target, with headroom for empty/dups — not full cartesian.
-        needed = max(1, math.ceil(target / max(1, results_per)))
-        max_scrape_calls = min(total_combos, max(target * 2, needed * 4 + 2))
+        if total_combos <= max(12, needed_by_hits * 2):
+            # Small selection: visit every combo once (results auto-scale to fill target)
+            max_scrape_calls = total_combos
+        else:
+            # Huge selection: don't run unbounded; still enough room to hit target
+            max_scrape_calls = min(
+                total_combos,
+                max(target * 2, needed_by_hits * 3 + 2, 12),
+            )
         max_scrape_calls = max(1, int(max_scrape_calls))
     else:
         max_scrape_calls = total_combos
@@ -1408,6 +1416,7 @@ def scrape_external_jobs(
         nonlocal collected, scrape_calls
         # Strict cap: never scrape with a wider hours window than requested
         hours = min(int(hours), hours_old) if strict_caps else int(hours)
+        combo_index = 0
         for qi, q in enumerate(queries, 1):
             if len(collected) >= target:
                 meta["stopped_reason"] = "target_reached"
@@ -1420,31 +1429,39 @@ def scrape_external_jobs(
                     meta["stopped_reason"] = "max_scrape_calls"
                     _notify_status(
                         f"Search attempt cap reached ({scrape_calls}/{max_scrape_calls} "
-                        f"LinkedIn calls). Stopping early — target={target}, "
-                        f"results_per={results_per}, hours_old={hours}. "
-                        f"Narrow queries/cities or raise Target / Hits per query."
+                        f"LinkedIn calls). Session={len(collected)}/{target}. "
+                        f"Add more queries/cities or raise Hits/Query if under target."
                     )
                     return
+
+                remaining = target - len(collected)
+                combos_left = max(1, total_combos - combo_index)
+                combo_index += 1
+                # Fair share so remaining combos can still fill target.
+                # Example: target=20, results_per=5, 1 combo left → request 20 (not 5).
+                fair_share = max(1, math.ceil(remaining / combos_left))
+                results_this_call = min(50, remaining, max(int(results_per), fair_share))
 
                 scrape_calls += 1
                 _notify_status(
                     f"[{qi:02d}/{len(queries)} · call {scrape_calls}/{max_scrape_calls}] "
                     f"LinkedIn scrape: {q!r} @ {city_name} "
-                    f"(hours_old={hours}, results≤{results_per}, target≤{target}"
+                    f"(hours_old={hours}, request≤{results_this_call}, "
+                    f"hits_pref={results_per}, remaining={remaining}, target={target}"
                     f"{f', col={session_col}' if session_col else ''})"
                 )
                 try:
                     batch = scrape_linkedin(
                         query=q,
                         location=city_name,
-                        results=results_per,  # strict results_per cap
-                        hours_old=hours,  # strict hours_old cap when strict_caps
+                        results=results_this_call,
+                        hours_old=hours,
                         country_indeed=country_indeed,
                         default_city=city_name,
                     )
-                    # Never keep more raw rows than results_per asked for
-                    if len(batch) > results_per:
-                        batch = batch[:results_per]
+                    # Cap raw batch to what we requested for this call
+                    if len(batch) > results_this_call:
+                        batch = batch[:results_this_call]
                     # Strict recency: drop rows outside hours_old (jobspy can leak older posts)
                     if strict_caps:
                         before = len(batch)
@@ -1460,7 +1477,8 @@ def scrape_external_jobs(
                             "city": city_name,
                             "country": country_indeed,
                             "hours_old": hours,
-                            "results_per": results_per,
+                            "results_requested": results_this_call,
+                            "results_per_pref": results_per,
                             "raw_count": len(batch),
                             "site": "linkedin",
                         }
@@ -1472,7 +1490,8 @@ def scrape_external_jobs(
                             "city": city_name,
                             "country": country_indeed,
                             "hours_old": hours,
-                            "results_per": results_per,
+                            "results_requested": results_this_call,
+                            "results_per_pref": results_per,
                             "error": str(e),
                             "site": "linkedin",
                         }
@@ -1490,9 +1509,9 @@ def scrape_external_jobs(
                     max_exp=max_exp,
                     strict_search=False,
                 )
-                # Hard per-call cap after filters
-                if len(filtered) > results_per:
-                    filtered = filtered[:results_per]
+                # Per-call cap = results_this_call (may be > results_per to fill target)
+                if len(filtered) > results_this_call:
+                    filtered = filtered[:results_this_call]
 
                 added = 0
                 for job in filtered:
@@ -1547,8 +1566,9 @@ def scrape_external_jobs(
 
     _notify_status(
         f"Live scrape plan: {len(queries)} quer(y/ies) × {len(cities)} cit(y/ies) "
-        f"= {total_combos} max combos · attempt cap {max_scrape_calls} · "
-        f"target≤{target} · results/q≤{results_per} · hours_old={hours_old} "
+        f"= {total_combos} combos · max_calls={max_scrape_calls} · "
+        f"TARGET={target} (hard stop) · hits_pref={results_per} "
+        f"(auto-scales up per call to fill target) · hours_old={hours_old} "
         f"· strict_caps={bool(strict_caps)}"
     )
     run_pass(hours_old)
