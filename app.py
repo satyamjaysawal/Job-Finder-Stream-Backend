@@ -29,27 +29,85 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 
-from settings import (
-    BASE_URL,
-    CONFIG_COLLECTION_NAME,
-    CONFIG_DOC_KEY,
-    CONFIG_FILTER,
-    CORS_ALLOW_CREDENTIALS,
-    CORS_ALLOW_HEADERS,
-    CORS_ALLOW_METHODS,
-    CORS_ORIGINS,
-    DATABASE_NAME,
-    HOST,
-    JOBS_COLLECTION_NAME,
-    MONGODB_URI,
-    PORT,
-    RELOAD,
-    RESERVED_COLLECTIONS,
-    SCRAPE_JSONS_COLLECTION_NAME,
-    configure_stdio_utf8,
-    public_settings_dict,
-    require_mongo_settings,
+import os
+import sys
+from dotenv import find_dotenv, load_dotenv
+
+# Load environment
+load_dotenv(find_dotenv(), override=False)
+
+# Server Configuration
+HOST: str = os.getenv("HOST", "127.0.0.1")
+PORT: int = int(os.getenv("PORT", "5000"))
+BASE_URL: str = os.getenv("BASE_URL", f"http://{HOST}:{PORT}").rstrip("/")
+API_PREFIX: str = os.getenv("API_PREFIX", "/api").rstrip("/") or "/api"
+RELOAD: bool = os.getenv("RELOAD", "true").lower() in {"1", "true", "yes", "on"}
+
+# MongoDB Configuration
+MONGODB_URI: str | None = os.getenv("MONGODB_URI")
+DATABASE_NAME: str | None = os.getenv("DATABASE_NAME", "job_portal")
+
+# Collection names
+JOBS_COLLECTION_NAME: str = "jobs"
+CONFIG_COLLECTION_NAME: str = "config"
+SCRAPE_JSONS_COLLECTION_NAME: str = "scrape_jsons"
+
+CONFIG_DOC_KEY: str = "scraper_settings"
+CONFIG_FILTER: dict = {"_key": CONFIG_DOC_KEY}
+
+RESERVED_COLLECTIONS: frozenset[str] = frozenset(
+    {
+        JOBS_COLLECTION_NAME,
+        CONFIG_COLLECTION_NAME,
+        SCRAPE_JSONS_COLLECTION_NAME,
+        "system.indexes",
+    }
 )
+
+# CORS Configuration (Standard localhost Vite ports + env configuration)
+_default_origins = [
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "http://127.0.0.1:4173",
+    "http://localhost:4173"
+]
+_raw_origins = os.getenv("CORS_ORIGINS")
+if _raw_origins:
+    CORS_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+else:
+    CORS_ORIGINS: list[str] = _default_origins
+
+CORS_ALLOW_CREDENTIALS: bool = True
+CORS_ALLOW_METHODS: list[str] = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+CORS_ALLOW_HEADERS: list[str] = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"]
+
+def require_mongo_settings() -> None:
+    """Raise error if MongoDB URI is missing."""
+    if not MONGODB_URI:
+        raise RuntimeError(
+            "MONGODB_URI is not set. Please add it to your .env file."
+        )
+
+def configure_stdio_utf8() -> None:
+    """Prefer UTF-8 on Windows consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8")
+            except Exception:
+                pass
+
+def public_settings_dict() -> dict:
+    """Non-secret settings safe to expose via API or health endpoints."""
+    return {
+        "base_url": BASE_URL,
+        "api_prefix": API_PREFIX,
+        "host": HOST,
+        "port": PORT,
+        "frontend_url": "http://127.0.0.1:5173",
+        "cors_origins": CORS_ORIGINS,
+        "database": DATABASE_NAME,
+    }
 
 # Optional LinkedIn scraper
 try:
