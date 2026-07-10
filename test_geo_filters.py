@@ -5,6 +5,7 @@ from app import (
     filter_jobs_list,
     resolve_indeed_country,
     _job_matches_country,
+    format_time_ago_hr_min,
 )
 
 
@@ -98,6 +99,19 @@ def test_country_match_helper():
     assert _job_matches_country(job, ["germany"]) is False
 
 
+def test_format_time_ago_hr_min():
+    assert format_time_ago_hr_min("5 minutes ago") == "5m"
+    assert format_time_ago_hr_min("25m") == "25m"
+    assert format_time_ago_hr_min("1 hour ago") == "01:00"
+    assert format_time_ago_hr_min("2 hours ago") == "02:00"
+    assert format_time_ago_hr_min("2h 15m") == "02:15"
+    assert format_time_ago_hr_min("1 day ago") == "24:00"
+    assert format_time_ago_hr_min("3 days ago") == "72:00"
+    assert format_time_ago_hr_min("just now") == "1m"
+    assert format_time_ago_hr_min("") == ""
+    assert format_time_ago_hr_min(None) == ""
+
+
 if __name__ == "__main__":
     tests = [
         test_resolve_empty_is_global,
@@ -110,6 +124,7 @@ if __name__ == "__main__":
         test_filter_country_only,
         test_filter_city_and_country,
         test_country_match_helper,
+        test_format_time_ago_hr_min,
     ]
     failed = 0
     for t in tests:

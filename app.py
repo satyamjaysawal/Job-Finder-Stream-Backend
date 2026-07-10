@@ -701,6 +701,100 @@ def make_snapshot_collection_name(custom_name: Optional[str] = None) -> str:
     return f"jobs_{stamp}_{micros}"
 
 
+def format_time_ago_hr_min(time_ago_str: str | None) -> str:
+    """
+    Format time_ago string to hr:min format if >= 1 hour, otherwise minutes only.
+    E.g. "5 minutes ago" -> "5m"
+         "2 hours ago"   -> "02:00"
+         "1 day ago"     -> "24:00"
+         "3 days ago"    -> "72:00"
+    """
+    if not time_ago_str:
+        return ""
+    
+    s = str(time_ago_str).strip().lower()
+    if not s or s in ("nan", "null", "none"):
+        return ""
+        
+    # Check if it already matches HH:MM format
+    if re.match(r"^\d+:\d{2}$", s):
+        parts = s.split(":")
+        try:
+            h = int(parts[0])
+            m = int(parts[1])
+            if h == 0:
+                return f"{m}m"
+            return f"{h:02d}:{m:02d}"
+        except ValueError:
+            pass
+
+    # Standardize/convert special values
+    if any(x in s for x in ("just now", "moment", "second", "active now", "online")):
+        return "1m"
+
+    # Hours (optionally with minutes, e.g. "1h 30m" or "1 hour 30 minutes")
+    h_match = re.search(r"\b(\d+)\s*(?:hours?|hrs?|h)\b", s)
+    if h_match:
+        hours = int(h_match.group(1))
+        minutes = 0
+        min_in_h_match = re.search(r"(?:hours?|hrs?|h)\s*(\d+)\s*(?:minutes?|mins?|m)\b", s)
+        if min_in_h_match:
+            minutes = int(min_in_h_match.group(1))
+        if hours == 0:
+            return f"{minutes}m"
+        return f"{hours:02d}:{minutes:02d}"
+
+    # Days
+    d_match = re.search(r"\b(\d+)\s*(?:days?|d)\b", s)
+    if d_match:
+        days = int(d_match.group(1))
+        hours = days * 24
+        if hours == 0:
+            return "0m"
+        return f"{hours:02d}:00"
+
+    # Weeks
+    w_match = re.search(r"\b(\d+)\s*(?:weeks?|w)\b", s)
+    if w_match:
+        weeks = int(w_match.group(1))
+        hours = weeks * 7 * 24
+        return f"{hours:02d}:00"
+
+    # Months
+    mo_match = re.search(r"\b(\d+)\s*(?:months?|mo)\b", s)
+    if mo_match:
+        months = int(mo_match.group(1))
+        hours = months * 30 * 24
+        return f"{hours:02d}:00"
+
+    # Years
+    y_match = re.search(r"\b(\d+)\s*(?:years?|y)\b", s)
+    if y_match:
+        years = int(y_match.group(1))
+        hours = years * 365 * 24
+        return f"{hours:02d}:00"
+
+    # Minutes
+    m_match = re.search(r"\b(\d+)\s*(?:minutes?|mins?|m)\b", s) or re.search(r"\b(\d+)\s*m\b", s)
+    if m_match:
+        minutes = int(m_match.group(1))
+        h = minutes // 60
+        m = minutes % 60
+        if h == 0:
+            return f"{m}m"
+        return f"{h:02d}:{m:02d}"
+
+    # Fallback search for any numbers
+    digits = re.findall(r"\d+", s)
+    if digits:
+        val = int(digits[0])
+        if val == 0:
+            return "0m"
+        return f"{val:02d}:00"
+
+    return ""
+
+
 def serialize_job(job: dict) -> dict:
     return {
         "title": job.get("title"),
@@ -710,7 +804,7 @@ def serialize_job(job: dict) -> dict:
         "country": job.get("country"),
         "job_url": job.get("job_url"),
         "category": job.get("category"),
-        "time_ago": job.get("time_ago"),
+        "time_ago": format_time_ago_hr_min(job.get("time_ago")),
         "scraped_at": job.get("scraped_at"),
         "description": job.get("description"),
         "date_posted": job.get("date_posted"),
