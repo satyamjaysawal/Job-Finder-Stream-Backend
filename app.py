@@ -703,11 +703,9 @@ def make_snapshot_collection_name(custom_name: Optional[str] = None) -> str:
 
 def format_time_ago_hr_min(time_ago_str: str | None) -> str:
     """
-    Format time_ago string to hr:min format if >= 1 hour, otherwise minutes only.
-    E.g. "5 minutes ago" -> "5m"
-         "2 hours ago"   -> "02:00"
-         "1 day ago"     -> "24:00"
-         "3 days ago"    -> "72:00"
+    Format time_ago string to:
+    - minutes only if < 1 hour (e.g. "5m")
+    - hours only if >= 1 hour (e.g. "2h", "24h")
     """
     if not time_ago_str:
         return ""
@@ -715,6 +713,12 @@ def format_time_ago_hr_min(time_ago_str: str | None) -> str:
     s = str(time_ago_str).strip().lower()
     if not s or s in ("nan", "null", "none"):
         return ""
+        
+    # Check if it already matches standard format like "2h" or "25m"
+    if re.match(r"^\d+m$", s):
+        return s
+    if re.match(r"^\d+h$", s):
+        return s
         
     # Check if it already matches HH:MM format
     if re.match(r"^\d+:\d{2}$", s):
@@ -724,7 +728,7 @@ def format_time_ago_hr_min(time_ago_str: str | None) -> str:
             m = int(parts[1])
             if h == 0:
                 return f"{m}m"
-            return f"{h:02d}:{m:02d}"
+            return f"{h}h"
         except ValueError:
             pass
 
@@ -736,13 +740,11 @@ def format_time_ago_hr_min(time_ago_str: str | None) -> str:
     h_match = re.search(r"\b(\d+)\s*(?:hours?|hrs?|h)\b", s)
     if h_match:
         hours = int(h_match.group(1))
-        minutes = 0
-        min_in_h_match = re.search(r"(?:hours?|hrs?|h)\s*(\d+)\s*(?:minutes?|mins?|m)\b", s)
-        if min_in_h_match:
-            minutes = int(min_in_h_match.group(1))
         if hours == 0:
+            min_in_h_match = re.search(r"(?:hours?|hrs?|h)\s*(\d+)\s*(?:minutes?|mins?|m)\b", s)
+            minutes = int(min_in_h_match.group(1)) if min_in_h_match else 0
             return f"{minutes}m"
-        return f"{hours:02d}:{minutes:02d}"
+        return f"{hours}h"
 
     # Days
     d_match = re.search(r"\b(\d+)\s*(?:days?|d)\b", s)
@@ -750,29 +752,29 @@ def format_time_ago_hr_min(time_ago_str: str | None) -> str:
         days = int(d_match.group(1))
         hours = days * 24
         if hours == 0:
-            return "0m"
-        return f"{hours:02d}:00"
+            return "1m"
+        return f"{hours}h"
 
     # Weeks
     w_match = re.search(r"\b(\d+)\s*(?:weeks?|w)\b", s)
     if w_match:
         weeks = int(w_match.group(1))
         hours = weeks * 7 * 24
-        return f"{hours:02d}:00"
+        return f"{hours}h"
 
     # Months
     mo_match = re.search(r"\b(\d+)\s*(?:months?|mo)\b", s)
     if mo_match:
         months = int(mo_match.group(1))
         hours = months * 30 * 24
-        return f"{hours:02d}:00"
+        return f"{hours}h"
 
     # Years
     y_match = re.search(r"\b(\d+)\s*(?:years?|y)\b", s)
     if y_match:
         years = int(y_match.group(1))
         hours = years * 365 * 24
-        return f"{hours:02d}:00"
+        return f"{hours}h"
 
     # Minutes
     m_match = re.search(r"\b(\d+)\s*(?:minutes?|mins?|m)\b", s) or re.search(r"\b(\d+)\s*m\b", s)
@@ -782,7 +784,7 @@ def format_time_ago_hr_min(time_ago_str: str | None) -> str:
         m = minutes % 60
         if h == 0:
             return f"{m}m"
-        return f"{h:02d}:{m:02d}"
+        return f"{h}h"
 
     # Fallback search for any numbers
     digits = re.findall(r"\d+", s)
