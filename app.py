@@ -1927,9 +1927,12 @@ def serialize_scrape_json_full(doc: dict) -> dict:
     if col_name and col_name in db.list_collection_names():
         col_jobs = list(db[col_name].find({}))
         for j in col_jobs:
+            serialized_job = serialize_job(j)
             if "_id" in j:
-                j["_id"] = str(j["_id"])
-            jobs.append(j)
+                serialized_job["_id"] = str(j["_id"])
+            else:
+                serialized_job["_id"] = None
+            jobs.append(serialized_job)
     for i, j in enumerate(jobs):
         if not j.get("_id"):
             j["_id"] = f"{meta['id']}-{i}"
