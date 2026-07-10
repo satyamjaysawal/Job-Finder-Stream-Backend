@@ -798,6 +798,72 @@ def format_time_ago_hr_min(time_ago_str: str | None) -> str:
 
 
 def serialize_job(job: dict) -> dict:
+    title = job.get("title") or ""
+    desc = job.get("description") or ""
+    
+    # 1. Easy Apply
+    is_easy = job.get("is_easy_apply")
+    if is_easy is None:
+        full_text = f"{title} {desc}".lower()
+        is_easy = "easy apply" in full_text or "apply directly" in full_text or "simple apply" in full_text
+    else:
+        is_easy = bool(is_easy)
+
+    # 2. Workplace Type
+    workplace = job.get("workplace_type")
+    if not workplace:
+        full_text = f"{title} {job.get('location') or ''} {desc}".lower()
+        if any(x in full_text for x in ("remote", "work from home", "wfh", "anywhere", "virtual")):
+            workplace = "remote"
+        elif any(x in full_text for x in ("hybrid", "flexible workplace", "split office")):
+            workplace = "hybrid"
+        else:
+            workplace = "onsite"
+    else:
+        workplace = str(workplace).strip().lower()
+
+    # 3. Job Type
+    job_type = job.get("job_type")
+    if not job_type:
+        full_text = f"{title} {desc}".lower()
+        if "internship" in full_text or "intern" in full_text:
+            job_type = "internship"
+        elif "part-time" in full_text or "part time" in full_text:
+            job_type = "part-time"
+        elif "contract" in full_text or "temporary" in full_text:
+            job_type = "contract"
+        elif "freelance" in full_text or "independent contractor" in full_text:
+            job_type = "freelance"
+        else:
+            job_type = "full-time"
+    else:
+        job_type = str(job_type).strip().lower()
+        if "full_time" in job_type or "fulltime" in job_type:
+            job_type = "full-time"
+        elif "part_time" in job_type or "parttime" in job_type:
+            job_type = "part-time"
+
+    # 4. Experience Level
+    exp_level = job.get("experience_level")
+    if not exp_level:
+        full_text = f"{title} {desc}".lower()
+        if "fresher" in full_text or "entry level" in full_text or "no experience" in full_text or "intern" in full_text:
+            exp_level = "fresher"
+        elif "senior" in full_text or "experienced" in full_text or "years of experience" in full_text or "yoe" in full_text or "mid" in full_text:
+            exp_level = "experienced"
+        else:
+            exp_level = "fresher"
+    else:
+        exp_level = str(exp_level).strip().lower()
+        if any(x in exp_level for x in ("fresher", "intern", "entry")):
+            exp_level = "fresher"
+        elif any(x in exp_level for x in ("mid", "associate", "senior", "lead", "staff", "principal")):
+            exp_level = "experienced"
+        elif any(x in exp_level for x in ("director", "vp", "executive", "chief")):
+            exp_level = "executive"
+        else:
+            exp_level = "fresher"
+
     return {
         "title": job.get("title"),
         "company": job.get("company"),
@@ -811,6 +877,10 @@ def serialize_job(job: dict) -> dict:
         "description": job.get("description"),
         "date_posted": job.get("date_posted"),
         "source": job.get("source"),
+        "is_easy_apply": is_easy,
+        "workplace_type": workplace,
+        "job_type": job_type,
+        "experience_level": exp_level,
     }
 
 
@@ -1241,6 +1311,22 @@ def scrape_linkedin(
         if not title:
             continue
 
+        is_easy = row.get("is_easy_apply") if "is_easy_apply" in df.columns else None
+        if is_easy is not None and str(is_easy).lower() == "nan":
+            is_easy = None
+            
+        workplace = row.get("workplace_type") if "workplace_type" in df.columns else None
+        if workplace is not None and str(workplace).lower() == "nan":
+            workplace = None
+            
+        j_type = row.get("job_type") if "job_type" in df.columns else None
+        if j_type is not None and str(j_type).lower() == "nan":
+            j_type = None
+            
+        e_level = row.get("experience_level") if "experience_level" in df.columns else None
+        if e_level is not None and str(e_level).lower() == "nan":
+            e_level = None
+
         jobs.append(
             {
                 "title": title,
@@ -1256,6 +1342,10 @@ def scrape_linkedin(
                 "scraped_at": scraped_at,
                 "description": description,
                 "search_term": query,
+                "is_easy_apply": is_easy,
+                "workplace_type": workplace,
+                "job_type": j_type,
+                "experience_level": e_level,
             }
         )
     return jobs

@@ -6,6 +6,7 @@ from app import (
     resolve_indeed_country,
     _job_matches_country,
     format_time_ago_hr_min,
+    serialize_job,
 )
 
 
@@ -114,6 +115,34 @@ def test_format_time_ago_hr_min():
     assert format_time_ago_hr_min(None) == ""
 
 
+def test_serialize_job_attributes():
+    # 1. Parse directly from preset fields
+    j1 = {
+        "title": "Software Engineer",
+        "description": "Python dev",
+        "is_easy_apply": True,
+        "workplace_type": "hybrid",
+        "job_type": "contract",
+        "experience_level": "mid_senior"
+    }
+    out1 = serialize_job(j1)
+    assert out1["is_easy_apply"] is True
+    assert out1["workplace_type"] == "hybrid"
+    assert out1["job_type"] == "contract"
+    assert out1["experience_level"] == "experienced"
+
+    # 2. Parse from title and description fallbacks
+    j2 = {
+        "title": "Generative AI Intern (Remote)",
+        "description": "This is an easy apply position. Looking for fresher developers to join full time.",
+    }
+    out2 = serialize_job(j2)
+    assert out2["is_easy_apply"] is True
+    assert out2["workplace_type"] == "remote"
+    assert out2["job_type"] == "internship"
+    assert out2["experience_level"] == "fresher"
+
+
 if __name__ == "__main__":
     tests = [
         test_resolve_empty_is_global,
@@ -127,6 +156,7 @@ if __name__ == "__main__":
         test_filter_city_and_country,
         test_country_match_helper,
         test_format_time_ago_hr_min,
+        test_serialize_job_attributes,
     ]
     failed = 0
     for t in tests:
@@ -135,6 +165,8 @@ if __name__ == "__main__":
             print(f"  OK  {t.__name__}")
         except Exception as e:
             failed += 1
+            import traceback
+            traceback.print_exc()
             print(f"  FAIL  {t.__name__}: {e}")
     print()
     if failed:
