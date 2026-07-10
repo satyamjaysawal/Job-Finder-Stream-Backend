@@ -142,6 +142,19 @@ def test_serialize_job_attributes():
     assert out2["job_type"] == "internship"
     assert out2["experience_level"] == "fresher"
 
+    # 3. Exact user example from LinkedIn UI
+    j3 = {
+        "title": "Software Engineer III",
+        "description": "Promoted by hirer · No response insights available yet\nOn-site\nContract\nEasy Apply\nSave",
+        "location": "Bengaluru, Karnataka, India",
+        "time_ago": "Reposted 34 minutes ago",
+    }
+    out3 = serialize_job(j3)
+    assert out3["is_easy_apply"] is True
+    assert out3["workplace_type"] == "onsite"
+    assert out3["job_type"] == "contract"
+    assert out3["time_ago"] == "34m"
+
 
 if __name__ == "__main__":
     tests = [

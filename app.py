@@ -821,6 +821,8 @@ def serialize_job(job: dict) -> dict:
             workplace = "onsite"
     else:
         workplace = str(workplace).strip().lower()
+        if workplace in ("onsite", "on-site", "on site", "in office", "office"):
+            workplace = "onsite"
 
     # 3. Job Type
     job_type = job.get("job_type")
