@@ -46,7 +46,6 @@ OUTPUT_FILE = OUTPUT_DIR / f"linkedin_jobs_hyderabad_6h_{TIMESTAMP}.json"
 
 # ── Search queries (latest AI / SWE jobs) ────────────────────────────────────
 SEARCH_QUERIES = [
-    "Generative AI Engineer",
     "GenAI Engineer",
     "AI Engineer",
     "Agentic AI Engineer",
@@ -66,6 +65,22 @@ SEARCH_QUERIES = [
     "Data Scientist",
     "Backend Engineer",
     "ML Platform Engineer",
+    "Generative AI Engineer",
+    "Frontend Developer",
+    "Software Developer",
+    "Forward Engineer",
+    "Go Developer",
+    "Go language",
+    "Human Resources Manager",
+    "HR Manager",
+    "HR Recruiter",
+    "Talent Acquisition Specialist",
+    "Technical Recruiter",
+    "HR Business Partner",
+    "HR Generalist",
+    "People Operations Manager",
+    "Recruitment Specialist",
+    "HR Operations Manager",
 ]
 
 TARGET      = 100   # stop after this many unique jobs

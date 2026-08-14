@@ -156,6 +156,29 @@ def test_serialize_job_attributes():
     assert out3["time_ago"] == "34m"
 
 
+def test_serialize_job_hr_attributes():
+    j1 = {
+        "title": "Technical Recruiter",
+        "description": "Contact HR: Sarah Jenkins (sarah.hr@techcorp.com) for details.",
+    }
+    out1 = serialize_job(j1)
+    assert out1["is_hr_role"] is True
+    assert out1["hr_role_category"] == "technical_recruiter"
+    assert out1["has_hr_contact"] is True
+    assert out1["hr_name"] == "Sarah Jenkins"
+    assert out1["hr_contact"] == "sarah.hr@techcorp.com"
+
+    j2 = {
+        "title": "Python Developer",
+        "description": "Send CV to careers@company.com",
+    }
+    out2 = serialize_job(j2)
+    assert out2["is_hr_role"] is False
+    assert out2["hr_role_category"] == "non_hr"
+    assert out2["has_hr_contact"] is True
+    assert out2["hr_contact"] == "careers@company.com"
+
+
 if __name__ == "__main__":
     tests = [
         test_resolve_empty_is_global,
@@ -170,6 +193,7 @@ if __name__ == "__main__":
         test_country_match_helper,
         test_format_time_ago_hr_min,
         test_serialize_job_attributes,
+        test_serialize_job_hr_attributes,
     ]
     failed = 0
     for t in tests:
@@ -186,3 +210,4 @@ if __name__ == "__main__":
         print(f"{failed}/{len(tests)} failed")
         raise SystemExit(1)
     print(f"All {len(tests)} tests passed.")
+

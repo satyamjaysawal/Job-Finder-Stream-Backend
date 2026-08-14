@@ -425,7 +425,6 @@ def _empty_config_doc() -> dict:
     return {
         "_key": CONFIG_DOC_KEY,
         "search_queries": [
-            "Generative AI Engineer",
             "GenAI Engineer",
             "AI Engineer",
             "Agentic AI Engineer",
@@ -445,6 +444,22 @@ def _empty_config_doc() -> dict:
             "Data Scientist",
             "Backend Engineer",
             "ML Platform Engineer",
+            "Generative AI Engineer",
+            "Frontend Developer",
+            "Software Developer",
+            "Forward Engineer",
+            "Go Developer",
+            "Go language",
+            "Human Resources Manager",
+            "HR Manager",
+            "HR Recruiter",
+            "Talent Acquisition Specialist",
+            "Technical Recruiter",
+            "HR Business Partner",
+            "HR Generalist",
+            "People Operations Manager",
+            "Recruitment Specialist",
+            "HR Operations Manager",
         ],
         "cities": [
             "Bengaluru",
@@ -561,6 +576,18 @@ def ensure_config_document() -> dict:
         config_col.update_one(
             {"_id": doc["_id"]},
             {"$set": {"countries": new_countries, "updated_at": touch_updated_at()}},
+        )
+        doc = config_col.find_one(CONFIG_FILTER)
+
+    # Merge default HR search queries if missing from existing database config doc
+    existing_queries = set(q.strip().lower() for q in (doc.get("search_queries") or []))
+    default_queries = defaults["search_queries"]
+    missing_queries = [q for q in default_queries if q.strip().lower() not in existing_queries]
+    if missing_queries:
+        new_queries = list(doc.get("search_queries") or []) + missing_queries
+        config_col.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"search_queries": new_queries, "updated_at": touch_updated_at()}},
         )
         doc = config_col.find_one(CONFIG_FILTER)
 
@@ -866,6 +893,86 @@ def serialize_job(job: dict) -> dict:
         else:
             exp_level = "fresher"
 
+    # 5. HR & Recruiter details
+    hr_name = (
+        job.get("hr_name")
+        or job.get("poster_name")
+        or job.get("recruiter_name")
+        or job.get("hiring_manager")
+    )
+    hr_contact = (
+        job.get("hr_contact")
+        or job.get("hr_email")
+        or job.get("poster_email")
+        or job.get("recruiter_email")
+        or job.get("contact")
+    )
+
+    full_text_lower = f"{title} {desc}".lower()
+
+    if not hr_name:
+        name_match = re.search(
+            r"(?:hr|recruiter|hiring manager|contact person)\s*[:\-]\s*([A-Za-z]+(?:\s+[A-Za-z]+)?)",
+            desc,
+            re.IGNORECASE,
+        )
+        if name_match:
+            hr_name = name_match.group(1).strip()
+
+    if not hr_contact:
+        email_match = re.search(
+            r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+            desc,
+        )
+        if email_match:
+            hr_contact = email_match.group(0).strip()
+        else:
+            phone_match = re.search(
+                r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
+                desc,
+            )
+            if phone_match and any(kw in full_text_lower for kw in ("hr", "call", "whatsapp", "contact", "phone", "mobile")):
+                hr_contact = phone_match.group(0).strip()
+
+    has_hr_contact = bool(
+        hr_name
+        or hr_contact
+        or any(
+            kw in full_text_lower
+            for kw in (
+                "contact hr",
+                "email hr",
+                "send resume to",
+                "send cv to",
+                "reach out to hr",
+                "recruiter email",
+                "hiring manager:",
+                "hr@",
+                "careers@",
+            )
+        )
+    )
+
+    # 6. HR Role detection
+    is_hr_role = bool(
+        re.search(
+            r"\b(hr|human\s+resources|recruiter|talent\s+acquisition|hiring\s+specialist|people\s+ops|people\s+operations|payroll)\b",
+            f"{title} {desc}",
+            re.IGNORECASE,
+        )
+    )
+
+    if re.search(r"\b(tech|technical|it|software|engineering)\s+(recruiter|ta|talent\s+acquisition)\b", f"{title} {desc}", re.IGNORECASE):
+        hr_role_category = "technical_recruiter"
+    elif re.search(r"\b(talent\s+acquisition|ta\s+specialist|recruiter|recruitment)\b", f"{title} {desc}", re.IGNORECASE):
+        hr_role_category = "talent_acquisition"
+    elif re.search(r"\b(payroll|compensation|benefits|rewards)\b", f"{title} {desc}", re.IGNORECASE):
+        hr_role_category = "hr_payroll"
+    elif is_hr_role:
+        hr_role_category = "hr_generalist"
+    else:
+        hr_role_category = "non_hr"
+
     return {
         "title": job.get("title"),
         "company": job.get("company"),
@@ -883,6 +990,11 @@ def serialize_job(job: dict) -> dict:
         "workplace_type": workplace,
         "job_type": job_type,
         "experience_level": exp_level,
+        "hr_name": hr_name or None,
+        "hr_contact": hr_contact or None,
+        "has_hr_contact": has_hr_contact,
+        "is_hr_role": is_hr_role,
+        "hr_role_category": hr_role_category,
     }
 
 
