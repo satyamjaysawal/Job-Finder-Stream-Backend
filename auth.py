@@ -172,6 +172,34 @@ def find_user(user_id: str) -> dict[str, Any] | None:
     return public_user(doc) if doc else None
 
 
+def user_from_token(token: str | None) -> dict[str, Any] | None:
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        return None
+    return find_user(str(payload.get("sub") or ""))
+
+
+def snapshot_owner_fields(user: dict[str, Any] | None) -> dict[str, Any]:
+    if not user:
+        return {}
+    return {
+        "owner_user_id": user.get("user_id"),
+        "owner_email": user.get("email"),
+        "owner_name": user.get("name"),
+        "owner_role": user.get("role") or ROLE_USER,
+    }
+
+
+def can_manage_snapshot(doc: dict[str, Any], user: dict[str, Any]) -> bool:
+    if (user.get("role") or ROLE_USER) == ROLE_ADMIN:
+        return True
+    owner = doc.get("owner_user_id")
+    return bool(owner and owner == user.get("user_id"))
+
+
 def current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Login required")

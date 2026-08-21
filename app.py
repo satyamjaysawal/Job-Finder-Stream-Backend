@@ -242,6 +242,7 @@ def _ensure_indexes() -> None:
     try:
         scrape_jsons_col.create_index([("created_at", DESCENDING)])
         scrape_jsons_col.create_index([("name", ASCENDING)])
+        scrape_jsons_col.create_index([("owner_user_id", ASCENDING)])
     except Exception:
         pass
 
@@ -288,6 +289,7 @@ from auth import (
     AuthRegister,
     ROLE_ADMIN,
     auth_payload,
+    can_manage_snapshot,
     create_anonymous_user,
     current_user,
     delete_all_users,
@@ -296,6 +298,8 @@ from auth import (
     login_user,
     register_user,
     require_role,
+    snapshot_owner_fields,
+    user_from_token,
 )
 
 
@@ -1627,6 +1631,7 @@ def begin_live_stream_snapshot(
     search_term: Optional[str] = None,
     filters: Optional[dict] = None,
     name: Optional[str] = None,
+    owner: Optional[dict] = None,
 ) -> dict:
     """
     Each Start Live Stream run creates:
@@ -1673,6 +1678,7 @@ def begin_live_stream_snapshot(
         },
         "job_count": 0,
         "status": "running",
+        **snapshot_owner_fields(owner),
     }
     result = scrape_jsons_col.insert_one(payload)
     doc = scrape_jsons_col.find_one({"_id": result.inserted_id})
@@ -2047,6 +2053,9 @@ def serialize_scrape_json_meta(doc: dict) -> dict:
         "config_snapshot": doc.get("config_snapshot") or {},
         "source": doc.get("source") or "search",
         "status": doc.get("status") or "completed",
+        "owner_user_id": doc.get("owner_user_id"),
+        "owner_email": doc.get("owner_email"),
+        "owner_name": doc.get("owner_name"),
     }
 
 
@@ -2084,6 +2093,7 @@ def create_scrape_json_document(
     search_term: Optional[str] = None,
     filters: Optional[dict] = None,
     name: Optional[str] = None,
+    owner: Optional[dict] = None,
 ) -> dict:
     """
     Create a NEW MongoDB collection for this snapshot and insert jobs into it.
@@ -2127,6 +2137,7 @@ def create_scrape_json_document(
             "country": cfg.get("country"),
         },
         "job_count": len(serialized_jobs),
+        **snapshot_owner_fields(owner),
     }
     result = scrape_jsons_col.insert_one(payload)
     doc = scrape_jsons_col.find_one({"_id": result.inserted_id})
@@ -2288,14 +2299,14 @@ def remove_country(data: CountryItem, _admin: dict = Depends(require_role(ROLE_A
 # ── Scrape JSON runs (each Search = new document) ────────────────────────────
 # NOTE: /search must be declared BEFORE /{json_id} so "search" is not captured as id.
 
-@app.get("/api/scrape-jsons")
-def list_scrape_jsons():
-    """
-    List all saved scrape / live-stream snapshot documents (metadata only).
-    Refreshes job_count from the actual MongoDB collection when present so
-    Dashboard always reflects real data after live streams complete.
-    """
-    docs = list(scrape_jsons_col.find({}).sort("created_at", -1))
+def _snapshot_query_for(user: dict) -> dict:
+    if (user.get("role") or "") == ROLE_ADMIN:
+        return {}
+    return {"owner_user_id": user.get("user_id")}
+
+
+def _list_snapshot_meta(user: dict) -> list[dict]:
+    docs = list(scrape_jsons_col.find(_snapshot_query_for(user)).sort("created_at", -1))
     known_cols = set(db.list_collection_names())
     out = []
     for d in docs:
@@ -2315,8 +2326,20 @@ def list_scrape_jsons():
     return out
 
 
+@app.get("/api/scrape-jsons")
+def list_scrape_jsons(user: dict = Depends(current_user)):
+    """
+    List saved scrape / live-stream snapshots for this user.
+    Admins see every collection; users see only their own.
+    """
+    return _list_snapshot_meta(user)
+
+
 @app.post("/api/scrape-jsons/search", status_code=201)
-def search_and_create_json(data: SearchCreateJson = SearchCreateJson()):
+def search_and_create_json(
+    data: SearchCreateJson = SearchCreateJson(),
+    user: dict = Depends(current_user),
+):
     """
     Search handler: creates a NEW MongoDB collection with matching job documents
     and a metadata row in scrape_jsons. Never overwrites an existing collection.
@@ -2357,6 +2380,7 @@ def search_and_create_json(data: SearchCreateJson = SearchCreateJson()):
         search_term=data.search,
         filters=filters,
         name=data.name,
+        owner=user,
     )
     full = serialize_scrape_json_full(doc)
     col_name = full.get("collection_name") or full.get("name")
@@ -2365,15 +2389,12 @@ def search_and_create_json(data: SearchCreateJson = SearchCreateJson()):
         "message": f"New snapshot collection created: {col_name}",
         "scrape_json": full,
         "collection_name": col_name,
-        "list": [
-            serialize_scrape_json_meta(d)
-            for d in scrape_jsons_col.find({}).sort("created_at", -1)
-        ],
+        "list": _list_snapshot_meta(user),
     }
 
 
 @app.get("/api/scrape-jsons/{json_id}")
-def get_scrape_json(json_id: str):
+def get_scrape_json(json_id: str, user: dict = Depends(current_user)):
     """Load one snapshot metadata and all jobs from its MongoDB collection."""
     oid = parse_object_id(json_id)
     if not oid:
@@ -2381,18 +2402,22 @@ def get_scrape_json(json_id: str):
     doc = scrape_jsons_col.find_one({"_id": oid})
     if not doc:
         raise HTTPException(status_code=404, detail="Snapshot not found")
+    if not can_manage_snapshot(doc, user):
+        raise HTTPException(status_code=403, detail="You can only open your own collections")
     return serialize_scrape_json_full(doc)
 
 
 @app.delete("/api/scrape-jsons/{json_id}")
-def delete_scrape_json(json_id: str, _admin: dict = Depends(require_role(ROLE_ADMIN))):
-    """Drop the snapshot's job collection and remove its metadata from scrape_jsons."""
+def delete_scrape_json(json_id: str, user: dict = Depends(current_user)):
+    """Users delete their own snapshots; admins can delete anyone's."""
     oid = parse_object_id(json_id)
     if not oid:
         raise HTTPException(status_code=400, detail="Invalid snapshot id")
     doc = scrape_jsons_col.find_one({"_id": oid})
     if not doc:
         raise HTTPException(status_code=404, detail="Snapshot not found")
+    if not can_manage_snapshot(doc, user):
+        raise HTTPException(status_code=403, detail="You can only delete your own collections")
 
     col_name = snapshot_collection_name(doc)
     if col_name and col_name not in RESERVED_COLLECTIONS:
@@ -2401,15 +2426,11 @@ def delete_scrape_json(json_id: str, _admin: dict = Depends(require_role(ROLE_AD
     result = scrape_jsons_col.delete_one({"_id": oid})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Snapshot not found")
-    remaining = [
-        serialize_scrape_json_meta(d)
-        for d in scrape_jsons_col.find({}).sort("created_at", -1)
-    ]
     return {
         "status": "success",
         "deleted_id": json_id,
         "deleted_collection": col_name,
-        "list": remaining,
+        "list": _list_snapshot_meta(user),
     }
 
 
@@ -2478,6 +2499,15 @@ def db_info():
 @app.websocket("/api/ws/jobs")
 async def websocket_jobs(websocket: WebSocket):
     await manager.connect(websocket)
+    ws_user = user_from_token(websocket.query_params.get("token"))
+    if not ws_user:
+        await websocket.send_json({
+            "type": "error",
+            "message": "Login required for live stream.",
+        })
+        await websocket.close(code=4401)
+        manager.disconnect(websocket)
+        return
     # Welcome + live DB metadata for Realtime Feed header
     await websocket.send_json({
         "type": "status",
@@ -2559,6 +2589,7 @@ async def websocket_jobs(websocket: WebSocket):
                     search_term=search or None,
                     filters=stream_filters,
                     name=custom_col_name or "live_stream",
+                    owner=ws_user,
                 )
                 session_collection = snapshot_collection_name(snapshot_doc) or make_snapshot_collection_name(
                     "live_stream"
