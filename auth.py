@@ -154,7 +154,7 @@ def create_anonymous_user() -> dict[str, Any]:
     doc = {
         "user_id": user_id,
         "email": f"anon-{user_id[:8]}@anonymous.local",
-        "name": "User",
+        "name": "Anonymous user",
         "role": ROLE_USER,
         "password_hash": hash_password(uuid4().hex),
         "anonymous": True,
@@ -202,3 +202,24 @@ def require_role(*allowed_roles: str):
         return user
 
     return _check
+
+
+def list_users() -> list[dict[str, Any]]:
+    docs = list(users_col().find({}).sort("created_at", -1))
+    return [public_user(doc) for doc in docs]
+
+
+def delete_user(user_id: str, actor_id: str) -> dict[str, Any]:
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Missing user id")
+    if user_id == actor_id:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account")
+    result = users_col().delete_one({"user_id": user_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"status": "success", "deleted": user_id}
+
+
+def delete_all_users(actor_id: str) -> dict[str, Any]:
+    result = users_col().delete_many({"user_id": {"$ne": actor_id}})
+    return {"status": "success", "deleted_count": result.deleted_count}

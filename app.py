@@ -290,6 +290,9 @@ from auth import (
     auth_payload,
     create_anonymous_user,
     current_user,
+    delete_all_users,
+    delete_user,
+    list_users,
     login_user,
     register_user,
     require_role,
@@ -2153,6 +2156,21 @@ def auth_anonymous():
 @app.get("/api/auth/me")
 def auth_me(user: dict = Depends(current_user)):
     return {"user": user}
+
+
+@app.get("/api/auth/users")
+def auth_list_users(_admin: dict = Depends(require_role(ROLE_ADMIN))):
+    return {"users": list_users()}
+
+
+@app.delete("/api/auth/users/{user_id}")
+def auth_delete_user(user_id: str, admin: dict = Depends(require_role(ROLE_ADMIN))):
+    return delete_user(user_id, admin["user_id"])
+
+
+@app.delete("/api/auth/users")
+def auth_delete_all_users(admin: dict = Depends(require_role(ROLE_ADMIN))):
+    return delete_all_users(admin["user_id"])
 
 
 @app.get("/api/health")
