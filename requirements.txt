@@ -10,6 +10,9 @@ python-dotenv>=1.0.0
 pymongo>=4.6.0
 dnspython>=2.0.0
 
+# Auth
+PyJWT>=2.8.0
+
 # LinkedIn scrape (same stack as linkedin_realtime_hyderabad.py)
 # On Python 3.13+ if pins fail:
 #   pip install python-jobspy --no-deps

@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
@@ -60,6 +60,7 @@ RESERVED_COLLECTIONS: frozenset[str] = frozenset(
         JOBS_COLLECTION_NAME,
         CONFIG_COLLECTION_NAME,
         SCRAPE_JSONS_COLLECTION_NAME,
+        "users",
         "system.indexes",
     }
 )
@@ -280,6 +281,18 @@ app.add_middleware(
     allow_credentials=CORS_ALLOW_CREDENTIALS,
     allow_methods=CORS_ALLOW_METHODS or ["*"],
     allow_headers=CORS_ALLOW_HEADERS or ["*"],
+)
+
+from auth import (
+    AuthLogin,
+    AuthRegister,
+    ROLE_ADMIN,
+    auth_payload,
+    create_anonymous_user,
+    current_user,
+    login_user,
+    register_user,
+    require_role,
 )
 
 
@@ -2119,6 +2132,29 @@ def create_scrape_json_document(
 
 # ── Health & config routes ───────────────────────────────────────────────────
 
+@app.post("/api/auth/register")
+def auth_register(data: AuthRegister):
+    doc = register_user(data.email, data.password, data.name, data.role)
+    return auth_payload(doc)
+
+
+@app.post("/api/auth/login")
+def auth_login(data: AuthLogin):
+    doc = login_user(data.email, data.password)
+    return auth_payload(doc)
+
+
+@app.post("/api/auth/anonymous")
+def auth_anonymous():
+    doc = create_anonymous_user()
+    return auth_payload(doc)
+
+
+@app.get("/api/auth/me")
+def auth_me(user: dict = Depends(current_user)):
+    return {"user": user}
+
+
 @app.get("/api/health")
 def health():
     """Liveness + non-secret runtime settings (base_url, cors, db name)."""
@@ -2148,7 +2184,7 @@ def get_config():
 
 
 @app.put("/api/config")
-def update_config(data: ConfigUpdate):
+def update_config(data: ConfigUpdate, _admin: dict = Depends(require_role(ROLE_ADMIN))):
     """
     Update any subset of config fields in the single `config` document.
     Supports scalars (target, results_per, hours_old, country, min_exp, max_exp)
@@ -2169,63 +2205,63 @@ def update_config(data: ConfigUpdate):
 
 
 @app.post("/api/config/queries")
-def add_query(data: QueryItem):
+def add_query(data: QueryItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
     """Add a search query into config.search_queries."""
     updated = add_list_item("search_queries", data.query)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.put("/api/config/queries")
-def edit_query(data: ListItemEdit):
+def edit_query(data: ListItemEdit, _admin: dict = Depends(require_role(ROLE_ADMIN))):
     """Edit (rename) a search query in the single config document."""
     updated = edit_list_item("search_queries", data.old_value, data.new_value)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.delete("/api/config/queries")
-def remove_query(data: QueryItem):
+def remove_query(data: QueryItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
     """Delete a search query from config.search_queries."""
     updated = remove_list_item("search_queries", data.query)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.post("/api/config/cities")
-def add_city(data: CityItem):
+def add_city(data: CityItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
     """Add a city into config.cities."""
     updated = add_list_item("cities", data.city)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.put("/api/config/cities")
-def edit_city(data: ListItemEdit):
+def edit_city(data: ListItemEdit, _admin: dict = Depends(require_role(ROLE_ADMIN))):
     """Edit (rename) a city in the single config document."""
     updated = edit_list_item("cities", data.old_value, data.new_value)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.delete("/api/config/cities")
-def remove_city(data: CityItem):
+def remove_city(data: CityItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
     """Delete a city from config.cities."""
     updated = remove_list_item("cities", data.city)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.post("/api/config/countries")
-def add_country(data: CountryItem):
+def add_country(data: CountryItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
     """Add a country into config.countries."""
     updated = add_list_item("countries", data.country)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.put("/api/config/countries")
-def edit_country(data: ListItemEdit):
+def edit_country(data: ListItemEdit, _admin: dict = Depends(require_role(ROLE_ADMIN))):
     """Edit (rename) a country in the single config document."""
     updated = edit_list_item("countries", data.old_value, data.new_value)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.delete("/api/config/countries")
-def remove_country(data: CountryItem):
+def remove_country(data: CountryItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
     """Delete a country from config.countries."""
     updated = remove_list_item("countries", data.country)
     return {"status": "success", "config": serialize_config(updated)}
@@ -2331,7 +2367,7 @@ def get_scrape_json(json_id: str):
 
 
 @app.delete("/api/scrape-jsons/{json_id}")
-def delete_scrape_json(json_id: str):
+def delete_scrape_json(json_id: str, _admin: dict = Depends(require_role(ROLE_ADMIN))):
     """Drop the snapshot's job collection and remove its metadata from scrape_jsons."""
     oid = parse_object_id(json_id)
     if not oid:
