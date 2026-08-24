@@ -20,7 +20,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -329,6 +329,166 @@ def _clean_str_list(values: Optional[list[Any]]) -> list[str]:
     return out
 
 
+# LinkedIn prints the same employer many ways: "Accenture", "Accenture in India",
+# "Amazon Web Services (AWS)". Live scrape UI treated those as different companies.
+HR_QUERY_RE = re.compile(
+    r"\b(?:hr|human resources|recruit(?:er|ment)|talent acquisition|"
+    r"people operations|people ops|payroll)\b",
+    re.IGNORECASE,
+)
+QUERY_GROUPS = ("developer", "hr")
+_COMPANY_NOISE_RE = re.compile(
+    r"[.,()|&+/]+|"
+    r"\b(?:inc|incorporated|llc|ltd|limited|pvt|private|plc|corp|corporation|"
+    r"co|company|group|services|solutions|technologies|technology|"
+    r"india|usa|uk|federal\s+services|engineering|web\s+services|aws|"
+    r"acceleration\s+centers?|global(?:\s+tech)?|north\s+america)\b|"
+    r"\bin\s+india\b",
+    re.IGNORECASE,
+)
+_known_companies_cache: Optional[list[str]] = None
+
+
+def _invalidate_known_companies_cache() -> None:
+    global _known_companies_cache
+    _known_companies_cache = None
+
+
+def get_known_companies_cached() -> list[str]:
+    global _known_companies_cache
+    if _known_companies_cache is not None:
+        return _known_companies_cache
+    try:
+        doc = config_col.find_one(CONFIG_FILTER) or {}
+        _known_companies_cache = _clean_str_list(doc.get("top_companies") or [])
+    except Exception:
+        _known_companies_cache = []
+    return _known_companies_cache
+
+
+def normalize_company_key(name: str) -> str:
+    s = (name or "").strip().lower()
+    s = _COMPANY_NOISE_RE.sub(" ", s)
+    s = re.sub(r"^the\s+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _company_token_in(haystack: str, needle: str) -> bool:
+    if not needle:
+        return False
+    if haystack == needle:
+        return True
+    return bool(
+        re.search(
+            rf"(?:^|[\s,;/|(]){re.escape(needle)}(?:$|[\s,;/)|])",
+            haystack,
+        )
+    )
+
+
+def companies_match(job_company: str, selected: list[str] | str | None = None) -> bool:
+    """True if job_company belongs to any selected employer (suffix-tolerant)."""
+    names = [selected] if isinstance(selected, str) else list(selected or [])
+    names = [n for n in (_strip_optional_name(n) for n in names) if n]
+    if not names:
+        return True
+    raw_job = (job_company or "").strip().lower()
+    if not raw_job:
+        return False
+    job_key = normalize_company_key(job_company)
+    for sel in names:
+        raw_sel = sel.lower()
+        sel_key = normalize_company_key(sel)
+        if _company_token_in(raw_job, raw_sel) or _company_token_in(raw_sel, raw_job):
+            return True
+        if sel_key and job_key and len(sel_key) >= 3 and len(job_key) >= 3:
+            if _company_token_in(job_key, sel_key) or _company_token_in(sel_key, job_key):
+                return True
+    return False
+
+
+def canonicalize_company(name: str, known: Optional[list[str]] = None) -> str:
+    """Map LinkedIn variants onto the saved company list when they match."""
+    original = (name or "").strip() or "Unknown"
+    if original == "Unknown":
+        return original
+    known_list = _clean_str_list(known if known is not None else get_known_companies_cached())
+    if not known_list:
+        return original
+    best: Optional[str] = None
+    for known_name in known_list:
+        if companies_match(original, [known_name]):
+            if best is None or len(known_name) > len(best):
+                best = known_name
+    return best or original
+
+
+def classify_query(
+    query: str,
+    overrides: Optional[dict[str, str]] = None,
+    allowed_groups: tuple[str, ...] = QUERY_GROUPS,
+) -> str:
+    q = (query or "").strip()
+    if not q:
+        return "developer"
+    mapping = {
+        str(k).strip().lower(): str(v).strip().lower()
+        for k, v in (overrides or {}).items()
+        if str(k).strip() and str(v).strip().lower() in allowed_groups
+    }
+    forced = mapping.get(q.lower())
+    if forced:
+        return forced
+    if HR_QUERY_RE.search(q):
+        return "hr"
+    return "developer"
+
+
+def group_search_queries(
+    queries: Optional[list[str]],
+    overrides: Optional[dict[str, str]] = None,
+    custom_groups: Optional[list[str]] = None,
+) -> dict[str, list[str]]:
+    custom = _clean_query_group_keys(custom_groups)
+    grouped: dict[str, list[str]] = {"developer": [], "hr": [], **{g: [] for g in custom}}
+    allowed = QUERY_GROUPS + tuple(custom)
+    for q in _clean_str_list(queries):
+        grouped[classify_query(q, overrides, allowed)].append(q)
+    return grouped
+
+
+def _strip_optional_name(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _clean_query_group_keys(raw: Any) -> list[str]:
+    """Custom department keys: unique, trimmed, lowercased."""
+    out: list[str] = []
+    for item in raw or []:
+        g = str(item or "").strip().lower()
+        if g and g not in QUERY_GROUPS and g not in out:
+            out.append(g)
+    return out
+
+
+def _doc_custom_groups(doc: Optional[dict]) -> list[str]:
+    return _clean_query_group_keys((doc or {}).get("custom_query_groups") or [])
+
+
+def _norm_overrides(raw: Any, custom_groups: Optional[list[str]] = None) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    allowed = QUERY_GROUPS + tuple(_clean_query_group_keys(custom_groups))
+    out: dict[str, str] = {}
+    for key, val in raw.items():
+        k = str(key or "").strip()
+        v = str(val or "").strip().lower()
+        if k and v in allowed:
+            out[k] = v
+    return out
+
+
 class ConfigUpdate(BaseModel):
     """Partial update for any config field in the single config document."""
 
@@ -343,6 +503,7 @@ class ConfigUpdate(BaseModel):
     search_queries: Optional[list[str]] = None
     cities: Optional[list[str]] = None
     countries: Optional[list[str]] = None
+    top_companies: Optional[list[str]] = None
 
     @field_validator("country", mode="before")
     @classmethod
@@ -354,7 +515,7 @@ class ConfigUpdate(BaseModel):
             raise ValueError("country cannot be empty")
         return s
 
-    @field_validator("search_queries", "cities", "countries", mode="before")
+    @field_validator("search_queries", "cities", "countries", "top_companies", mode="before")
     @classmethod
     def clean_lists(cls, v: Any) -> Optional[list[str]]:
         if v is None:
@@ -367,11 +528,21 @@ class ConfigUpdate(BaseModel):
 class QueryItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
     query: str = Field(..., min_length=1)
+    group: Optional[str] = None
 
     @field_validator("query")
     @classmethod
     def strip_query(cls, v: str) -> str:
         return _strip_nonempty(v)
+
+    @field_validator("group")
+    @classmethod
+    def normalize_group(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or str(v).strip() == "":
+            return None
+        # Membership against built-in + custom departments is enforced in
+        # set_query_group, which has access to the config document.
+        return str(v).strip().lower()
 
 
 class CityItem(BaseModel):
@@ -384,6 +555,18 @@ class CityItem(BaseModel):
         return _strip_nonempty(v)
 
 
+class GroupItem(BaseModel):
+    """Custom department (query group) add/remove payload."""
+
+    model_config = ConfigDict(extra="forbid")
+    group: str = Field(..., min_length=1)
+
+    @field_validator("group")
+    @classmethod
+    def strip_group(cls, v: str) -> str:
+        return _strip_nonempty(v)
+
+
 class CountryItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
     country: str = Field(..., min_length=1)
@@ -391,6 +574,16 @@ class CountryItem(BaseModel):
     @field_validator("country")
     @classmethod
     def strip_country_item(cls, v: str) -> str:
+        return _strip_nonempty(v)
+
+
+class CompanyItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    company: str = Field(..., min_length=1)
+
+    @field_validator("company")
+    @classmethod
+    def strip_company(cls, v: str) -> str:
         return _strip_nonempty(v)
 
 
@@ -429,7 +622,7 @@ class SearchCreateJson(BaseModel):
 
 # ── Config helpers (single collection: `config`, single document) ────────────
 
-CONFIG_LIST_FIELDS = ("search_queries", "cities", "countries")
+CONFIG_LIST_FIELDS = ("search_queries", "cities", "countries", "top_companies")
 CONFIG_SCALAR_FIELDS = (
     "target",
     "results_per",
@@ -481,6 +674,12 @@ def _empty_config_doc() -> dict:
             "Recruitment Specialist",
             "HR Operations Manager",
         ],
+        "top_companies": [
+            "Accenture", "TCS", "Infosys", "Wipro", "HCLTech", "Cognizant",
+            "Capgemini", "IBM", "Deloitte", "EY", "Google", "Microsoft",
+            "Amazon", "Apple", "Meta", "Adobe", "Salesforce", "Atlassian",
+            "Oracle", "SAP",
+        ],
         "cities": [
             "Bengaluru",
             "Hyderabad",
@@ -529,6 +728,8 @@ def _empty_config_doc() -> dict:
         "country": "India",
         "min_exp": None,
         "max_exp": None,
+        "custom_query_groups": [],
+        "query_group_overrides": {},
         "updated_at": None,
     }
 
@@ -578,7 +779,7 @@ def ensure_config_document() -> dict:
     # Fill only missing keys — never overwrite user-cleared lists with defaults
     defaults = _empty_config_doc()
     patch: dict[str, Any] = {}
-    for field in (*CONFIG_LIST_FIELDS, *CONFIG_SCALAR_FIELDS, "updated_at"):
+    for field in (*CONFIG_LIST_FIELDS, *CONFIG_SCALAR_FIELDS, "custom_query_groups", "query_group_overrides", "updated_at"):
         if field not in doc:
             patch[field] = defaults[field]
     if "_key" not in doc:
@@ -611,6 +812,20 @@ def ensure_config_document() -> dict:
         )
         doc = config_col.find_one(CONFIG_FILTER)
 
+    # Merge default companies + collapse case-insensitive duplicates
+    existing_companies = _clean_str_list(doc.get("top_companies") or [])
+    default_companies = defaults["top_companies"]
+    have = {c.lower() for c in existing_companies}
+    missing_companies = [c for c in default_companies if c.lower() not in have]
+    cleaned_companies = _clean_str_list(existing_companies + missing_companies)
+    if cleaned_companies != list(doc.get("top_companies") or []):
+        config_col.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"top_companies": cleaned_companies, "updated_at": touch_updated_at()}},
+        )
+        doc = config_col.find_one(CONFIG_FILTER)
+        _invalidate_known_companies_cache()
+
     # Enforce single document: remove any other docs in config collection
     config_col.delete_many({"_id": {"$ne": doc["_id"]}})
     return doc
@@ -625,6 +840,24 @@ def update_config_fields(fields: dict[str, Any]) -> dict:
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     ensure_config_document()
+    if "top_companies" in fields:
+        fields["top_companies"] = _clean_str_list(fields.get("top_companies") or [])
+        _invalidate_known_companies_cache()
+    if "search_queries" in fields:
+        fields["search_queries"] = _clean_str_list(fields.get("search_queries") or [])
+    if "cities" in fields:
+        fields["cities"] = _clean_str_list(fields.get("cities") or [])
+    if "countries" in fields:
+        fields["countries"] = _clean_str_list(fields.get("countries") or [])
+    if "custom_query_groups" in fields:
+        fields["custom_query_groups"] = _clean_query_group_keys(fields.get("custom_query_groups"))
+    if "query_group_overrides" in fields:
+        custom = _clean_query_group_keys(
+            fields.get("custom_query_groups", get_config_doc().get("custom_query_groups"))
+        )
+        fields["query_group_overrides"] = _norm_overrides(
+            fields.get("query_group_overrides"), custom
+        )
     fields = {**fields, "updated_at": touch_updated_at(), "_key": CONFIG_DOC_KEY}
     config_col.update_one(CONFIG_FILTER, {"$set": fields}, upsert=True)
     return get_config_doc()
@@ -633,30 +866,30 @@ def update_config_fields(fields: dict[str, Any]) -> dict:
 def add_list_item(field: str, value: str) -> dict:
     if field not in CONFIG_LIST_FIELDS:
         raise HTTPException(status_code=400, detail=f"Invalid list field: {field}")
-    ensure_config_document()
-    config_col.update_one(
-        CONFIG_FILTER,
-        {
-            "$addToSet": {field: value},
-            "$set": {"updated_at": touch_updated_at(), "_key": CONFIG_DOC_KEY},
-        },
-        upsert=True,
-    )
-    return get_config_doc()
+    doc = ensure_config_document()
+    items = _clean_str_list(list(doc.get(field) or []))
+    if any(str(x).lower() == value.lower() for x in items):
+        raise HTTPException(status_code=400, detail=f"'{value}' already exists in {field}")
+    items.append(value)
+    return update_config_fields({field: items})
 
 
 def remove_list_item(field: str, value: str) -> dict:
     if field not in CONFIG_LIST_FIELDS:
         raise HTTPException(status_code=400, detail=f"Invalid list field: {field}")
-    ensure_config_document()
-    config_col.update_one(
-        CONFIG_FILTER,
-        {
-            "$pull": {field: value},
-            "$set": {"updated_at": touch_updated_at()},
-        },
-    )
-    return get_config_doc()
+    doc = ensure_config_document()
+    items = list(doc.get(field) or [])
+    kept = [x for x in items if str(x).strip().lower() != value.strip().lower()]
+    if len(kept) == len(items):
+        raise HTTPException(status_code=404, detail=f"'{value}' not found in {field}")
+    fields: dict[str, Any] = {field: _clean_str_list(kept)}
+    if field == "search_queries":
+        overrides = _norm_overrides(doc.get("query_group_overrides"), _doc_custom_groups(doc))
+        for key in list(overrides):
+            if key.lower() == value.strip().lower():
+                overrides.pop(key, None)
+        fields["query_group_overrides"] = overrides
+    return update_config_fields(fields)
 
 
 def edit_list_item(field: str, old_value: str, new_value: str) -> dict:
@@ -665,14 +898,86 @@ def edit_list_item(field: str, old_value: str, new_value: str) -> dict:
         raise HTTPException(status_code=400, detail=f"Invalid list field: {field}")
     doc = ensure_config_document()
     items = list(doc.get(field) or [])
-    try:
-        idx = items.index(old_value)
-    except ValueError:
+    idx = next((i for i, x in enumerate(items) if str(x).strip().lower() == old_value.strip().lower()), None)
+    if idx is None:
         raise HTTPException(status_code=404, detail=f"'{old_value}' not found in {field}")
-    if new_value != old_value and new_value in items:
+    if new_value.strip().lower() != old_value.strip().lower() and any(
+        str(x).strip().lower() == new_value.strip().lower() for x in items
+    ):
         raise HTTPException(status_code=400, detail=f"'{new_value}' already exists in {field}")
     items[idx] = new_value
-    return update_config_fields({field: items})
+    fields: dict[str, Any] = {field: _clean_str_list(items)}
+    if field == "search_queries":
+        overrides = _norm_overrides(doc.get("query_group_overrides"), _doc_custom_groups(doc))
+        moved = None
+        for key in list(overrides):
+            if key.lower() == old_value.strip().lower():
+                moved = overrides.pop(key)
+        if moved is not None:
+            overrides[new_value] = moved
+        fields["query_group_overrides"] = overrides
+    return update_config_fields(fields)
+
+
+def set_query_group(query: str, group: Optional[str]) -> dict:
+    """Pin a query to a department even when the name does not match the HR regex."""
+    doc = ensure_config_document()
+    custom = _doc_custom_groups(doc)
+    overrides = _norm_overrides(doc.get("query_group_overrides"), custom)
+    key = (query or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="query cannot be empty")
+    if group:
+        if group not in QUERY_GROUPS + tuple(custom):
+            raise HTTPException(status_code=400, detail=f"Unknown query group: '{group}'")
+        # Drop any previous case-variant key, then set.
+        for existing in list(overrides):
+            if existing.lower() == key.lower():
+                overrides.pop(existing, None)
+        overrides[key] = group
+    else:
+        for existing in list(overrides):
+            if existing.lower() == key.lower():
+                overrides.pop(existing, None)
+    return update_config_fields({"query_group_overrides": overrides})
+
+
+def add_query_group(name: str) -> dict:
+    """Register a custom department (query group) beyond Developer/HR."""
+    key = (name or "").strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="Department name cannot be empty")
+    if key in QUERY_GROUPS:
+        raise HTTPException(status_code=400, detail=f"'{key}' is a built-in department")
+    doc = ensure_config_document()
+    custom = _doc_custom_groups(doc)
+    if key in custom:
+        raise HTTPException(status_code=400, detail=f"Department '{key}' already exists")
+    custom.append(key)
+    return update_config_fields({"custom_query_groups": custom})
+
+
+def remove_query_group(name: str) -> dict:
+    """Delete a custom department; its queries fall back to default classification."""
+    key = (name or "").strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="Department name cannot be empty")
+    if key in QUERY_GROUPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{key}' is a built-in department and cannot be deleted",
+        )
+    doc = ensure_config_document()
+    custom = _doc_custom_groups(doc)
+    if key not in custom:
+        raise HTTPException(status_code=404, detail=f"Department '{key}' not found")
+    custom.remove(key)
+    # Drop pins pointing at the deleted department (queries revert to auto-classify).
+    overrides = _norm_overrides(doc.get("query_group_overrides"), custom + [key])
+    overrides = {q: g for q, g in overrides.items() if g != key}
+    return update_config_fields(
+        {"custom_query_groups": custom, "query_group_overrides": overrides}
+    )
 
 
 def serialize_config(doc: Optional[dict]) -> dict:
@@ -681,12 +986,28 @@ def serialize_config(doc: Optional[dict]) -> dict:
         base.pop("_key", None)
         base["is_ready"] = False
         base["collection"] = "config"
+        queries = _clean_str_list(base.get("search_queries") or [])
+        overrides = _norm_overrides(base.get("query_group_overrides"))
+        base["search_queries"] = queries
+        base["top_companies"] = _clean_str_list(base.get("top_companies") or [])
+        base["query_groups"] = group_search_queries(
+            queries, overrides, base.get("custom_query_groups")
+        )
+        base["query_group_overrides"] = overrides
         return base
+    queries = _clean_str_list(doc.get("search_queries") or [])
+    custom = _doc_custom_groups(doc)
+    overrides = _norm_overrides(doc.get("query_group_overrides"), custom)
+    companies = _clean_str_list(doc.get("top_companies") or [])
     return {
         "collection": "config",
-        "search_queries": list(doc.get("search_queries") or []),
-        "cities": list(doc.get("cities") or []),
-        "countries": list(doc.get("countries") or []),
+        "search_queries": queries,
+        "cities": _clean_str_list(doc.get("cities") or []),
+        "countries": _clean_str_list(doc.get("countries") or []),
+        "top_companies": companies,
+        "query_groups": group_search_queries(queries, overrides, custom),
+        "custom_query_groups": custom,
+        "query_group_overrides": overrides,
         "target": doc.get("target"),
         "results_per": doc.get("results_per"),
         "hours_old": doc.get("hours_old"),
@@ -993,9 +1314,11 @@ def serialize_job(job: dict) -> dict:
     else:
         hr_role_category = "non_hr"
 
+    raw_company = job.get("company_raw") or job.get("company")
     return {
         "title": job.get("title"),
-        "company": job.get("company"),
+        "company": canonicalize_company(raw_company or ""),
+        "company_raw": raw_company,
         "location": job.get("location"),
         "city": job.get("city"),
         "country": job.get("country"),
@@ -1271,6 +1594,8 @@ def filter_jobs_list(
     min_exp: Optional[int] = None,
     max_exp: Optional[int] = None,
     country_param: str = "",
+    company_param: str = "",
+    exclude_company_param: str = "",
     *,
     strict_search: bool = True,
 ) -> list[dict]:
@@ -1278,6 +1603,8 @@ def filter_jobs_list(
     search_terms = _split_csv(search)
     selected_cities = [c.lower() for c in _split_csv(city_param)]
     selected_countries = [co.lower() for co in _split_csv(country_param)]
+    selected_companies = _split_csv(company_param)
+    excluded_companies = _split_csv(exclude_company_param)
 
     out = []
     for job in jobs:
@@ -1296,6 +1623,11 @@ def filter_jobs_list(
             continue
         if not _job_matches_country(job, selected_countries):
             continue
+        job_company = job.get("company_raw") or job.get("company") or ""
+        if selected_companies and not companies_match(job_company, selected_companies):
+            continue
+        if excluded_companies and companies_match(job_company, excluded_companies):
+            continue
         if min_exp is not None or max_exp is not None:
             if not job_matches_exp_range(description, min_exp, max_exp):
                 continue
@@ -1311,6 +1643,8 @@ def collect_jobs_from_live_collection(
     min_exp: Optional[int] = None,
     max_exp: Optional[int] = None,
     country_param: str = "",
+    company_param: str = "",
+    exclude_company_param: str = "",
 ) -> list[dict]:
     query: dict = {}
     cat = (category or "").strip().lower()
@@ -1327,6 +1661,8 @@ def collect_jobs_from_live_collection(
         min_exp=min_exp,
         max_exp=max_exp,
         country_param=country_param,
+        company_param=company_param,
+        exclude_company_param=exclude_company_param,
     )
     if limit is not None and limit > 0:
         filtered = filtered[:limit]
@@ -1363,6 +1699,38 @@ def _city_from_location(location: str, fallback_city: str) -> str:
     if not loc or loc.lower() == "nan":
         return fallback_city or "Hyderabad"
     return loc.split(",")[0].strip() or fallback_city or "Hyderabad"
+
+
+def normalize_job_url(value: Any) -> str:
+    """Return the stable URL identity used for job deduplication.
+
+    LinkedIn commonly adds per-search tracking query parameters and fragments to
+    an otherwise identical job link.  Those values identify the click/search,
+    not the job, so they must not create another job document.
+    """
+    raw = str(value or "").strip()
+    if not raw or raw.lower() == "nan":
+        return ""
+
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        # Keep a malformed non-empty value usable as an exact-match key.
+        return raw
+
+    if not parsed.scheme or not parsed.netloc:
+        return raw
+
+    path = parsed.path.rstrip("/") or "/"
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            path,
+            "",  # Search/tracking parameters are not part of the job identity.
+            "",  # Fragments only identify a page position.
+        )
+    )
 
 
 def scrape_linkedin(
@@ -1417,8 +1785,8 @@ def scrape_linkedin(
     scraped_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for _, row in df.iterrows():
-        url = str(row.get("job_url", "") or "").strip()
-        if not url or url.lower() == "nan":
+        url = normalize_job_url(row.get("job_url"))
+        if not url:
             continue
 
         raw_date = str(row.get("date_posted", "") or "").strip()
@@ -1439,7 +1807,8 @@ def scrape_linkedin(
 
         city = _city_from_location(location_val, fallback_city)
         title = str(row.get("title", "") or "").strip()
-        company = str(row.get("company", "") or "").strip()
+        company_raw = str(row.get("company", "") or "").strip()
+        company = canonicalize_company(company_raw or "Unknown")
         description = _safe_str(row.get("description")) or ""
 
         if not title:
@@ -1465,6 +1834,7 @@ def scrape_linkedin(
             {
                 "title": title,
                 "company": company or "Unknown",
+                "company_raw": company_raw or company or "Unknown",
                 "location": location_val,
                 "city": city,
                 "country": country_code or "Global",
@@ -1497,8 +1867,9 @@ def upsert_job(
     - also_global: when writing to a session collection, also mirror into `jobs`
     Returns serialized doc including Mongo _id and save confirmation flags.
     """
-    url = (job.get("job_url") or "").strip()
+    url = normalize_job_url(job.get("job_url"))
     payload = {k: v for k, v in (job or {}).items() if k != "_id"}
+    payload["job_url"] = url
     target_name = (collection_name or "").strip() or JOBS_COLLECTION_NAME
     target_col = db[target_name]
 
@@ -1711,6 +2082,8 @@ def scrape_external_jobs(
     search: str = "",
     city: str = "",
     countries: str = "",
+    companies: str = "",
+    exclude_companies: str = "",
     results_per: int = 10,
     hours_old: int = 6,
     target: int = 20,
@@ -1743,6 +2116,8 @@ def scrape_external_jobs(
     # Empty = global search (do NOT fall back to config India/Hyderabad).
     cities = _split_csv(city)
     country_list = _split_csv(countries)
+    company_list = _split_csv(companies)
+    exclude_company_list = _split_csv(exclude_companies)
     location_plans = build_location_plans(cities, country_list)
     geo_mode = (
         "city+country"
@@ -1768,7 +2143,6 @@ def scrape_external_jobs(
     target = _clamp_positive_int(
         target if target is not None else cfg.get("target"),
         int(cfg.get("target") or 20),
-        maximum=200,
     )
     session_col = (collection_name or "").strip() or None
 
@@ -1795,6 +2169,8 @@ def scrape_external_jobs(
         "queries": queries,
         "cities": cities,
         "countries": country_list,
+        "companies": company_list,
+        "exclude_companies": exclude_company_list,
         "geo_mode": geo_mode,
         "location_plans": [p.get("label") for p in location_plans],
         "results_per": results_per,
@@ -1935,16 +2311,18 @@ def scrape_external_jobs(
                     search="",
                     city_param=city_param,
                     country_param=country_param,
+                    exclude_company_param=",".join(exclude_company_list),
                     min_exp=min_exp,
                     max_exp=max_exp,
                     strict_search=False,
                 )
-                if city_param or country_param:
+                if city_param or country_param or exclude_company_list:
                     dropped_geo = len(batch) - len(filtered)
                     if dropped_geo > 0:
                         _notify_status(
-                            f"  Geo-filter dropped {dropped_geo} job(s) "
-                            f"(city={city_param or 'any'}, country={country_param or 'any'})"
+                            f"  Filter dropped {dropped_geo} job(s) "
+                            f"(city={city_param or 'any'}, country={country_param or 'any'}, "
+                            f"excluded={', '.join(exclude_company_list) if exclude_company_list else 'none'})"
                         )
                 # Per-call cap = results_this_call (may be > results_per to fill target)
                 if len(filtered) > results_this_call:
@@ -1954,10 +2332,12 @@ def scrape_external_jobs(
                 for job in filtered:
                     if len(collected) >= target:
                         break
-                    url = job.get("job_url")
+                    url = normalize_job_url(job.get("job_url"))
                     if not url or url in seen_urls:
                         continue
                     seen_urls.add(url)
+                    # Persist and emit the same canonical URL used as the key.
+                    job["job_url"] = url
                     # Real-time write into session collection (and global jobs)
                     serialized = upsert_job(job, collection_name=session_col)
                     collected.append(serialized)
@@ -2148,7 +2528,8 @@ def create_scrape_json_document(
 
 @app.post("/api/auth/register")
 def auth_register(data: AuthRegister):
-    doc = register_user(data.email, data.password, data.name, data.role)
+    # Public signup is always a normal user. Admin is assigned separately.
+    doc = register_user(data.email, data.password, data.name, ROLE_USER)
     return auth_payload(doc)
 
 
@@ -2213,7 +2594,7 @@ def get_config():
 
 
 @app.put("/api/config")
-def update_config(data: ConfigUpdate, _admin: dict = Depends(require_role(ROLE_ADMIN))):
+def update_config(data: ConfigUpdate, _user: dict = Depends(current_user)):
     """
     Update any subset of config fields in the single `config` document.
     Supports scalars (target, results_per, hours_old, country, min_exp, max_exp)
@@ -2234,65 +2615,102 @@ def update_config(data: ConfigUpdate, _admin: dict = Depends(require_role(ROLE_A
 
 
 @app.post("/api/config/queries")
-def add_query(data: QueryItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
+def add_query(data: QueryItem, _user: dict = Depends(current_user)):
     """Add a search query into config.search_queries."""
     updated = add_list_item("search_queries", data.query)
+    if data.group:
+        updated = set_query_group(data.query, data.group)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.put("/api/config/queries")
-def edit_query(data: ListItemEdit, _admin: dict = Depends(require_role(ROLE_ADMIN))):
+def edit_query(data: ListItemEdit, _user: dict = Depends(current_user)):
     """Edit (rename) a search query in the single config document."""
     updated = edit_list_item("search_queries", data.old_value, data.new_value)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.delete("/api/config/queries")
-def remove_query(data: QueryItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
+def remove_query(data: QueryItem, _user: dict = Depends(current_user)):
     """Delete a search query from config.search_queries."""
     updated = remove_list_item("search_queries", data.query)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.post("/api/config/cities")
-def add_city(data: CityItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
+def add_city(data: CityItem, _user: dict = Depends(current_user)):
     """Add a city into config.cities."""
     updated = add_list_item("cities", data.city)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.put("/api/config/cities")
-def edit_city(data: ListItemEdit, _admin: dict = Depends(require_role(ROLE_ADMIN))):
+def edit_city(data: ListItemEdit, _user: dict = Depends(current_user)):
     """Edit (rename) a city in the single config document."""
     updated = edit_list_item("cities", data.old_value, data.new_value)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.delete("/api/config/cities")
-def remove_city(data: CityItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
+def remove_city(data: CityItem, _user: dict = Depends(current_user)):
     """Delete a city from config.cities."""
     updated = remove_list_item("cities", data.city)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.post("/api/config/countries")
-def add_country(data: CountryItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
+def add_country(data: CountryItem, _user: dict = Depends(current_user)):
     """Add a country into config.countries."""
     updated = add_list_item("countries", data.country)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.put("/api/config/countries")
-def edit_country(data: ListItemEdit, _admin: dict = Depends(require_role(ROLE_ADMIN))):
+def edit_country(data: ListItemEdit, _user: dict = Depends(current_user)):
     """Edit (rename) a country in the single config document."""
     updated = edit_list_item("countries", data.old_value, data.new_value)
     return {"status": "success", "config": serialize_config(updated)}
 
 
 @app.delete("/api/config/countries")
-def remove_country(data: CountryItem, _admin: dict = Depends(require_role(ROLE_ADMIN))):
+def remove_country(data: CountryItem, _user: dict = Depends(current_user)):
     """Delete a country from config.countries."""
     updated = remove_list_item("countries", data.country)
+    return {"status": "success", "config": serialize_config(updated)}
+
+
+@app.post("/api/config/companies")
+def add_company(data: CompanyItem, _user: dict = Depends(current_user)):
+    """Add a company into config.top_companies."""
+    updated = add_list_item("top_companies", data.company)
+    return {"status": "success", "config": serialize_config(updated)}
+
+
+@app.put("/api/config/companies")
+def edit_company(data: ListItemEdit, _user: dict = Depends(current_user)):
+    """Edit (rename) a company in the single config document."""
+    updated = edit_list_item("top_companies", data.old_value, data.new_value)
+    return {"status": "success", "config": serialize_config(updated)}
+
+
+@app.delete("/api/config/companies")
+def remove_company(data: CompanyItem, _user: dict = Depends(current_user)):
+    """Delete a company from config.top_companies."""
+    updated = remove_list_item("top_companies", data.company)
+    return {"status": "success", "config": serialize_config(updated)}
+
+
+@app.post("/api/config/groups")
+def add_group(data: GroupItem, _user: dict = Depends(current_user)):
+    """Add a custom department (query group) beyond Developer/HR."""
+    updated = add_query_group(data.group)
+    return {"status": "success", "config": serialize_config(updated)}
+
+
+@app.delete("/api/config/groups")
+def remove_group(data: GroupItem, _user: dict = Depends(current_user)):
+    """Delete a custom department; its queries revert to default classification."""
+    updated = remove_query_group(data.group)
     return {"status": "success", "config": serialize_config(updated)}
 
 
@@ -2551,7 +2969,7 @@ async def websocket_jobs(websocket: WebSocket):
                 city = data.get("city", "") or ""
                 category = data.get("category", "") or ""
                 # Strict parameter caps — hard min/max ceilings for live stream
-                target = _clamp_positive_int(data.get("target"), 20, maximum=200)
+                target = _clamp_positive_int(data.get("target"), 20)
                 results_per = _clamp_positive_int(data.get("results_per"), 10, maximum=50)
                 hours_old = _clamp_positive_int(data.get("hours_old"), 6, maximum=168)
                 min_exp = data.get("min_exp")
@@ -2567,6 +2985,8 @@ async def websocket_jobs(websocket: WebSocket):
                     except (TypeError, ValueError):
                         max_exp = None
                 countries = data.get("countries", "") or ""
+                companies = data.get("companies", "") or ""
+                exclude_companies = data.get("exclude_companies", "") or ""
                 custom_col_name = (data.get("collection_name") or data.get("name") or "").strip()
                 session_id = str(ObjectId())
 
@@ -2577,6 +2997,8 @@ async def websocket_jobs(websocket: WebSocket):
                     "city": city or None,
                     "category": category or None,
                     "countries": countries or None,
+                    "companies": companies or None,
+                    "exclude_companies": exclude_companies or None,
                     "target": target,
                     "results_per": results_per,
                     "hours_old": hours_old,
@@ -2654,6 +3076,7 @@ async def websocket_jobs(websocket: WebSocket):
                         min_exp=min_exp,
                         max_exp=max_exp,
                         country_param=countries,
+                        exclude_company_param=exclude_companies,
                     )
                     jobs = jobs[:target]
                     total = len(jobs)
@@ -2732,6 +3155,7 @@ async def websocket_jobs(websocket: WebSocket):
                             search=search,
                             city=city,
                             countries=countries,
+                            exclude_companies=exclude_companies,
                             results_per=results_per,
                             hours_old=hours_old,
                             target=target,
@@ -2808,6 +3232,7 @@ async def websocket_jobs(websocket: WebSocket):
                             min_exp=min_exp,
                             max_exp=max_exp,
                             country_param=countries,
+                            exclude_company_param=exclude_companies,
                         )
                         jobs = jobs[:target]
                         meta = {
