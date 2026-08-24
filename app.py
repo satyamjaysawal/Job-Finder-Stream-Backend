@@ -788,43 +788,12 @@ def ensure_config_document() -> dict:
         config_col.update_one({"_id": doc["_id"]}, {"$set": patch})
         doc = config_col.find_one(CONFIG_FILTER)
 
-    # Merge default worldwide IT countries that are missing from the existing database config doc
-    existing_countries = set(doc.get("countries") or [])
-    default_countries = defaults["countries"]
-    missing_countries = [c for c in default_countries if c not in existing_countries]
-    if missing_countries:
-        new_countries = list(doc.get("countries") or []) + missing_countries
-        config_col.update_one(
-            {"_id": doc["_id"]},
-            {"$set": {"countries": new_countries, "updated_at": touch_updated_at()}},
-        )
-        doc = config_col.find_one(CONFIG_FILTER)
+    # Countries are seeded by _empty_config_doc() for a brand-new config only.
+    # Do not merge missing defaults on every read: that made an intentional
+    # country deletion reappear immediately after the DELETE response.
 
-    # Merge default HR search queries if missing from existing database config doc
-    existing_queries = set(q.strip().lower() for q in (doc.get("search_queries") or []))
-    default_queries = defaults["search_queries"]
-    missing_queries = [q for q in default_queries if q.strip().lower() not in existing_queries]
-    if missing_queries:
-        new_queries = list(doc.get("search_queries") or []) + missing_queries
-        config_col.update_one(
-            {"_id": doc["_id"]},
-            {"$set": {"search_queries": new_queries, "updated_at": touch_updated_at()}},
-        )
-        doc = config_col.find_one(CONFIG_FILTER)
-
-    # Merge default companies + collapse case-insensitive duplicates
-    existing_companies = _clean_str_list(doc.get("top_companies") or [])
-    default_companies = defaults["top_companies"]
-    have = {c.lower() for c in existing_companies}
-    missing_companies = [c for c in default_companies if c.lower() not in have]
-    cleaned_companies = _clean_str_list(existing_companies + missing_companies)
-    if cleaned_companies != list(doc.get("top_companies") or []):
-        config_col.update_one(
-            {"_id": doc["_id"]},
-            {"$set": {"top_companies": cleaned_companies, "updated_at": touch_updated_at()}},
-        )
-        doc = config_col.find_one(CONFIG_FILTER)
-        _invalidate_known_companies_cache()
+    # Existing lists are user-managed. Do not merge defaults on every read:
+    # intentional query/company deletions must remain deleted after refresh.
 
     # Enforce single document: remove any other docs in config collection
     config_col.delete_many({"_id": {"$ne": doc["_id"]}})
