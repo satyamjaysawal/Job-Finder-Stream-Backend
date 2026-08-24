@@ -1741,6 +1741,7 @@ def scrape_linkedin(
     *,
     country_indeed: str = "",
     default_city: str = "",
+    sites: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     Call python-jobspy for LinkedIn only (mirrors linkedin_realtime_hyderabad.py).
@@ -1759,8 +1760,9 @@ def scrape_linkedin(
     hours_old = max(1, int(hours_old or 6))
     fallback_city = (default_city or (loc.split(",")[0].strip() if loc else "") or "Global")
 
+    selected_sites = [str(site).strip().lower() for site in (sites or ["linkedin"]) if str(site).strip()]
     scrape_kwargs: dict[str, Any] = {
-        "site_name": ["linkedin"],
+        "site_name": selected_sites or ["linkedin"],
         "search_term": query,
         "results_wanted": results,
         "hours_old": hours_old,
@@ -1842,7 +1844,7 @@ def scrape_linkedin(
                 "date_posted": date_posted,
                 "time_ago": time_ago,
                 "category": f"{hours_old}h",
-                "source": "linkedin",
+                "source": str(row.get("site", "") or "").strip().lower() or (selected_sites[0] if len(selected_sites) == 1 else "jobspy"),
                 "scraped_at": scraped_at,
                 "description": description,
                 "search_term": query,
@@ -2084,6 +2086,7 @@ def scrape_external_jobs(
     countries: str = "",
     companies: str = "",
     exclude_companies: str = "",
+    sites: Optional[list[str]] = None,
     results_per: int = 10,
     hours_old: int = 6,
     target: int = 20,
@@ -2118,6 +2121,7 @@ def scrape_external_jobs(
     country_list = _split_csv(countries)
     company_list = _split_csv(companies)
     exclude_company_list = _split_csv(exclude_companies)
+    site_list = [s.lower() for s in (sites or ["linkedin"]) if s]
     location_plans = build_location_plans(cities, country_list)
     geo_mode = (
         "city+country"
@@ -2179,7 +2183,7 @@ def scrape_external_jobs(
         "strict_caps": bool(strict_caps),
         "max_scrape_calls": max_scrape_calls,
         "collection_name": session_col or JOBS_COLLECTION_NAME,
-        "site": "linkedin",
+        "sites": site_list,
         "attempts": [],
         "expanded_hours": None,
         "stopped_reason": None,
@@ -2246,19 +2250,24 @@ def scrape_external_jobs(
                 scrape_calls += 1
                 _notify_status(
                     f"[{qi:02d}/{len(queries)} · call {scrape_calls}/{max_scrape_calls}] "
-                    f"LinkedIn scrape: {q!r} @ {loc_label} "
+                        f"JobSpy scrape ({', '.join(site_list)}): {q!r} @ {loc_label} "
                     f"(geo={geo_mode}, hours_old={hours}, request≤{results_this_call}, "
                     f"hits_pref={results_per}, remaining={remaining}, target={target}"
                     f"{f', col={session_col}' if session_col else ''})"
                 )
                 try:
+                    # JobSpy has no portable company parameter across all supported
+                    # boards. Bias the search with the company name, then apply the
+                    # authoritative normalized company filter below.
+                    scrape_query = f"{q} {company_list[0]}" if company_list else q
                     batch = scrape_linkedin(
-                        query=q,
+                        query=scrape_query,
                         location=loc_value,
                         results=results_this_call,
                         hours_old=hours,
                         country_indeed=country_code,
                         default_city=filter_city or loc_value,
+                        sites=site_list,
                     )
                     # Cap raw batch to what we requested for this call
                     if len(batch) > results_this_call:
@@ -2275,6 +2284,7 @@ def scrape_external_jobs(
                     meta["attempts"].append(
                         {
                             "query": q,
+                            "scrape_query": scrape_query,
                             "location": loc_label,
                             "city": filter_city or None,
                             "country": country_code or None,
@@ -2316,6 +2326,17 @@ def scrape_external_jobs(
                     max_exp=max_exp,
                     strict_search=False,
                 )
+                if company_list:
+                    before_company = len(filtered)
+                    filtered = [
+                        job for job in filtered
+                        if companies_match(job.get("company_raw") or job.get("company") or "", company_list)
+                    ]
+                    if before_company != len(filtered):
+                        _notify_status(
+                            f"  Company-only filter kept {len(filtered)}/{before_company} job(s): "
+                            f"{', '.join(company_list)}"
+                        )
                 if city_param or country_param or exclude_company_list:
                     dropped_geo = len(batch) - len(filtered)
                     if dropped_geo > 0:
@@ -2987,6 +3008,12 @@ async def websocket_jobs(websocket: WebSocket):
                 countries = data.get("countries", "") or ""
                 companies = data.get("companies", "") or ""
                 exclude_companies = data.get("exclude_companies", "") or ""
+                allowed_sites = {"linkedin", "indeed", "glassdoor", "zip_recruiter", "google", "bayt", "naukri"}
+                requested_sites = data.get("sites") or ["linkedin"]
+                if isinstance(requested_sites, str):
+                    requested_sites = _split_csv(requested_sites)
+                sites = [str(site).strip().lower() for site in requested_sites if str(site).strip().lower() in allowed_sites]
+                sites = sites or ["linkedin"]
                 custom_col_name = (data.get("collection_name") or data.get("name") or "").strip()
                 session_id = str(ObjectId())
 
@@ -2999,6 +3026,7 @@ async def websocket_jobs(websocket: WebSocket):
                     "countries": countries or None,
                     "companies": companies or None,
                     "exclude_companies": exclude_companies or None,
+                    "sites": sites,
                     "target": target,
                     "results_per": results_per,
                     "hours_old": hours_old,
@@ -3038,7 +3066,7 @@ async def websocket_jobs(websocket: WebSocket):
                 await websocket.send_json({
                     "type": "status",
                     "message": (
-                        f"Starting LinkedIn live scrape (STRICT caps) "
+                        f"Starting JobSpy live scrape ({', '.join(sites)}) (STRICT caps) "
                         f"(Target≤{target}, Results/query≤{results_per}, "
                         f"Hours old={hours_old}, "
                         f"Countries: {countries or 'India'}, "
@@ -3077,6 +3105,7 @@ async def websocket_jobs(websocket: WebSocket):
                         max_exp=max_exp,
                         country_param=countries,
                         exclude_company_param=exclude_companies,
+                        company_param=companies,
                     )
                     jobs = jobs[:target]
                     total = len(jobs)
@@ -3155,7 +3184,9 @@ async def websocket_jobs(websocket: WebSocket):
                             search=search,
                             city=city,
                             countries=countries,
+                            companies=companies,
                             exclude_companies=exclude_companies,
+                            sites=sites,
                             results_per=results_per,
                             hours_old=hours_old,
                             target=target,
