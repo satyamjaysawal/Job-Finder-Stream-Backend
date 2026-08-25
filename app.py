@@ -67,6 +67,10 @@ RESERVED_COLLECTIONS: frozenset[str] = frozenset(
 
 # CORS Configuration (localhost Vite ports + FRONTEND_URL / CORS_ORIGINS)
 _default_origins = [
+    # Keep the deployed frontend working even if CORS_ORIGINS was not added
+    # to the Vercel project environment yet.
+    "https://job-finder-stream.vercel.app",
+    "https://job-finder-stream-satyam-jaysawals-projects.vercel.app",
     "http://127.0.0.1:5173",
     "http://localhost:5173",
     "http://127.0.0.1:4173",
