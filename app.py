@@ -292,6 +292,7 @@ from auth import (
     AuthLogin,
     AuthRegister,
     ROLE_ADMIN,
+    ROLE_USER,
     auth_payload,
     can_manage_snapshot,
     create_anonymous_user,
